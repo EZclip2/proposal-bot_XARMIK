@@ -1,7 +1,7 @@
 {
   "name": "ideal-suggestion-bot",
-  "version": "1.0.0",
-  "description": "Telegram-бот предложки: карточка-модерации, мини-приложение и ИИ-фильтр (Gemini)",
+  "version": "1.1.0",
+  "description": "Telegram-бот предложки: карточка-модерации, мини-приложение и ИИ-фильтр (OpenAI-совместимый API)",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -10,7 +10,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@google/generative-ai": "latest",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "node-telegram-bot-api": "^0.66.0"
