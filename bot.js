@@ -25,7 +25,7 @@ if (!TOKEN || !MOD_CHAT_ID || !BOT_USERNAME || !APP_NAME) {
 
 // ======================= ИИ-ФИЛЬТР (Gemini) =======================
 const GEMINI_KEY   = (process.env.GEMINI_API_KEY || '').trim();
-const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-1.5-flash').trim();
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-flash-latest').trim();
 let aiModel = null;
 if (GEMINI_KEY) {
   try {
