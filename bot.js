@@ -23,26 +23,22 @@ if (!TOKEN || !MOD_CHAT_ID || !BOT_USERNAME || !APP_NAME) {
 }
 
 // ======================= ДЕТЕКТОР СПАМА (без ИИ) =======================
-// Два независимых правила: флуд и повтор фразы.
-const userMsgLog   = new Map(); // userId → [timestamp, ...]  (для флуда)
-const userLastText = new Map(); // userId → { text, time }    (для дублей)
+const userMsgLog   = new Map();
+const userLastText = new Map();
 
-const SPAM_FLOOD_WINDOW = 30  * 1000; // окно флуда, мс
-const SPAM_FLOOD_LIMIT  = 5;          // >5 сообщений в окне = флуд
-const SPAM_DUP_WINDOW   = 2  * 60 * 1000; // повтор той же фразы в течение 2 мин
+const SPAM_FLOOD_WINDOW = 30  * 1000;
+const SPAM_FLOOD_LIMIT  = 5;
+const SPAM_DUP_WINDOW   = 2  * 60 * 1000;
 
-// Возвращает 'flood' | 'duplicate' | null
 function recordAndCheckSpam(userId, text) {
   const uid = String(userId);
   const now = Date.now();
 
-  // Флуд
   const log = (userMsgLog.get(uid) || []).filter(t => now - t < SPAM_FLOOD_WINDOW);
   log.push(now);
   userMsgLog.set(uid, log);
   if (log.length > SPAM_FLOOD_LIMIT) return 'flood';
 
-  // Дубль (только для текстовых сообщений)
   if (text) {
     const last = userLastText.get(uid);
     if (last && last.text === text && now - last.time < SPAM_DUP_WINDOW) return 'duplicate';
@@ -52,33 +48,7 @@ function recordAndCheckSpam(userId, text) {
   return null;
 }
 
-// ======================= ЛОКАЛЬНЫЙ ФИЛЬТР ОЧЕВИДНОГО МУСОРА (без ИИ) =======================
-// Ловит самые частые случаи "trash" из промпта ИИ-классификатора локально —
-// это самая большая экономия токенов, т.к. такие сообщения вообще не идут в батч.
-// Специально консервативен: если есть малейшее сомнение — пропускает дальше, к ИИ.
-const TRASH_WORDS = new Set([
-  'привет', 'здравствуйте', 'драсте', 'ку', 'хай', 'hi', 'hello', 'hey',
-  'тест', 'test', 'проверка',
-  'ок', 'окей', 'ok', 'okay', 'ага', 'угу', 'да', 'нет',
-  'лол', 'lol', 'кек', 'ахах', 'ахаха', 'хах', 'ха',
-  'спасибо', 'спс', 'пожалуйста', 'пж',
-]);
-
-function isObviousTrash(text) {
-  const t = text.trim().toLowerCase().replace(/[.,!?…]+$/g, '');
-  if (!t) return false;
-  // 1-2 символа без учёта пунктуации — не может быть осмысленным обращением
-  if (t.replace(/[^a-zа-яё0-9]/gi, '').length <= 2) return true;
-  // одно слово из списка филлеров
-  if (!/\s/.test(t) && TRASH_WORDS.has(t)) return true;
-  return false;
-}
-
 // ======================= ИИ-КЛАССИФИКАЦИЯ (батчинг + дебаунс) =======================
-// Провайдер задаётся env — сменить без правки кода:
-//   OpenRouter: AI_BASE_URL=https://openrouter.ai/api/v1  AI_MODEL=meta-llama/llama-3.3-70b-instruct:free
-//   Groq:       AI_BASE_URL=https://api.groq.com/openai/v1 AI_MODEL=openai/gpt-oss-20b
-//   DeepSeek:   AI_BASE_URL=https://api.deepseek.com        AI_MODEL=deepseek-chat
 const AI_API_KEY  = (process.env.AI_API_KEY || '').trim();
 const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').trim().replace(/\/+$/, '');
 const AI_MODEL    = (process.env.AI_MODEL || 'meta-llama/llama-3.3-70b-instruct:free').trim();
@@ -91,17 +61,19 @@ const AI_SYSTEM =
   '  NOT trash: rude-but-real feedback ("всё говно", "ужасный сервис"), vague negatives ("всё плохо"), short real questions ("цена?", "когда?", "где?").\n' +
   '- "biz": business proposals, ads, partnerships, commercial offers.\n' +
   '- "reg": everything else — questions, feedback, bugs, suggestions, complaints, even if vague or emotional.\n' +
-  'For trash only — set "mute": true if the message shows DELIBERATE malice: targeted insults, hate, threats, intentional spam flooding, or repeated nonsense after a warning. Otherwise false.\n' +
+  'For trash only — set "mute": true if the message shows DELIBERATE malice: targeted insults, hate, threats, intentional spam flooding, or repeated nonsense after a warning.\n' +
+  'Set "mute": false if the message is just unclear, meaningless, or unintentional (user likely confused or testing).\n' +
+  'When trash+mute=false: fill "reply" with a polite Russian request to rephrase.\n' +
+  'When trash+mute=true or cat!=trash: leave "reply" empty.\n' +
   'When unsure between trash and reg → choose reg.\n' +
   'Input: [{"id":1,"text":"..."}]\n' +
-  'Output ONLY compact JSON, no markdown, no <think>, no explanations, no text outside JSON:\n' +
-  '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","mute":false}]}';
+  'Output only valid JSON, no markdown:\n' +
+  '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","mute":false,"reply":"..."}]}';
 
-// Параметры дебаунс-буфера
 const DEBOUNCE_FIRST = 15000;
 const DEBOUNCE_EXT   =  5000;
 const DEBOUNCE_MAX   = 45000;
-const BATCH_MAX      =    25;
+const BATCH_MAX      =    15;
 
 let batchItems    = [];
 let batchStart    = null;
@@ -109,8 +81,7 @@ let batchDeadline = null;
 let batchTimer    = null;
 let batchSeq      = 0;
 
-// хранит msgId сообщения «⏳ Получено» для удаления перед итоговым ответом
-const pendingAck = new Map(); // userId → { chatId, msgId }
+const pendingAck = new Map();
 
 async function deletePendingAck(userId) {
   const entry = pendingAck.get(String(userId));
@@ -118,9 +89,6 @@ async function deletePendingAck(userId) {
   pendingAck.delete(String(userId));
   try { await bot.deleteMessage(entry.chatId, entry.msgId); } catch {}
 }
-
-const TRASH_REPLY_TEXT =
-  '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
 
 async function flushBatch() {
   clearTimeout(batchTimer);
@@ -131,27 +99,26 @@ async function flushBatch() {
 
   const aiItems = items
     .filter(it => (it.msg.text || it.msg.caption || '').trim())
-    // 400 символов достаточно, чтобы понять категорию — экономим входные токены
-    .map(it => ({ id: it.id, text: (it.msg.text || it.msg.caption || '').slice(0, 400) }));
+    .map(it => ({ id: it.id, text: (it.msg.text || it.msg.caption || '').slice(0, 1000) }));
 
   const classMap = await classifyBatch(aiItems);
 
   for (const { id, msg } of items) {
-    const { cat, mute } = classMap.get(id) || { cat: 'reg', mute: false };
+    const { cat, mute, reply } = classMap.get(id) || { cat: 'reg', mute: false, reply: '' };
 
     await deletePendingAck(msg.from.id);
 
     if (cat === 'trash') {
       if (mute) {
-        // Намеренное нарушение — короткий мут (в отличие от ручных нарушений/спама)
-        muteUser(msg.from.id, AI_MUTE_MS);
+        muteUser(msg.from.id);
         await bot.sendMessage(msg.from.id,
-          '🚫 <b>Сообщение нарушает правила.</b>\n\nОтправка заблокирована на <b>2 минуты</b>.',
+          '🚫 <b>Сообщение нарушает правила.</b>\n\nОтправка заблокирована на <b>15 минут</b>.',
           { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       } else {
-        // Непонятное сообщение — просим переформулировать (единый шаблон вместо
-        // персонального текста от ИИ — экономит выходные токены на каждом сообщении)
-        await bot.sendMessage(msg.from.id, TRASH_REPLY_TEXT, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+        const text = (reply && reply.trim())
+          ? reply
+          : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
+        await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       }
     } else {
       const kind = cat === 'biz' ? 'biz' : 'normal';
@@ -168,84 +135,48 @@ function scheduleBatch() {
   batchTimer = setTimeout(flushBatch, Math.max(0, batchDeadline - Date.now()));
 }
 
-// Извлекает JSON из ответа LLM: убирает ```json-обёртку, при необходимости
-// вырезает первый {...}-блок из окружающего текста.
-function parseAiJson(content) {
-  if (!content || !content.trim()) throw new Error('no json in LLM response (пустой content)');
-  const cleaned = content
-    // reasoning-модели (DeepSeek-R1 и т.п.) иногда пишут рассуждения прямо в content
-    // вместо отдельного поля reasoning — вырезаем такой блок целиком.
-    .replace(/<think>[\s\S]*?<\/think>/gi, '')
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/```\s*$/i, '')
-    .trim();
-  try { return JSON.parse(cleaned); } catch {}
-  const match = cleaned.match(/\{[\s\S]*\}/);
-  if (match) {
-    try { return JSON.parse(match[0]); } catch {}
-  }
-  throw new Error('no json in LLM response: ' + cleaned.slice(0, 200));
-}
-
 async function classifyBatch(items) {
-  const fallback = () => new Map(items.map(i => [i.id, { cat: 'reg', mute: false }]));
-  if (!AI_API_KEY || !items.length) return fallback();
-
-  const VALID = new Set(['trash', 'biz', 'reg']);
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const ctrl = new AbortController();
-    const abortTimer = setTimeout(() => ctrl.abort(), 20000);
-    try {
-      const resp = await fetch(`${AI_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
-        body: JSON.stringify({
-          model: AI_MODEL, temperature: 0,
-          // Ответ теперь компактный ({id,cat,mute} без текста reply) — 50 токенов на
-          // сообщение с запасом хватает. Минимум 300 — страховка на случай, если
-          // AI_MODEL всё же reasoning-модель и потратит часть лимита на "размышления".
-          max_tokens: Math.max(300, 50 * items.length + 30),
-          response_format: { type: 'json_object' },
-          // OpenRouter: явно просим не тратить токены на reasoning-трейс
-          // (для провайдеров, которые это поле не знают, — просто игнорируется).
-          ...(AI_BASE_URL.includes('openrouter.ai') ? { reasoning: { enabled: false } } : {}),
-          messages: [
-            { role: 'system', content: AI_SYSTEM },
-            { role: 'user', content: JSON.stringify(items) },
-          ],
-        }),
-        signal: ctrl.signal,
-      });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
-      const data = await resp.json();
-      const content = data?.choices?.[0]?.message?.content || '';
-      const parsed = parseAiJson(content);
-
-      const result = fallback();
-      for (const r of (parsed.results || [])) {
-        if (result.has(r.id)) {
-          const cat = VALID.has(r.cat) ? r.cat : 'reg';
-          result.set(r.id, {
-            cat,
-            mute: cat === 'trash' && r.mute === true,
-          });
-        }
+  const result = new Map(items.map(i => [i.id, { cat: 'reg', mute: false, reply: '' }]));
+  if (!AI_API_KEY || !items.length) return result;
+  const ctrl = new AbortController();
+  const abortTimer = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const resp = await fetch(`${AI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
+      body: JSON.stringify({
+        model: AI_MODEL, temperature: 0, max_tokens: 100 * items.length + 50,
+        messages: [
+          { role: 'system', content: AI_SYSTEM },
+          { role: 'user', content: JSON.stringify(items) },
+        ],
+      }),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content || '';
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('no JSON in LLM response');
+    const parsed = JSON.parse(jsonMatch[0]);
+    const VALID = new Set(['trash', 'biz', 'reg']);
+    for (const r of (parsed.results || [])) {
+      if (result.has(r.id)) {
+        const cat = VALID.has(r.cat) ? r.cat : 'reg';
+        result.set(r.id, {
+          cat,
+          mute:  cat === 'trash' && r.mute === true,
+          reply: String(r.reply || ''),
+        });
       }
-      console.log(`classifyBatch: ${items.length} msg → [${[...result.values()].map(v => v.cat + (v.mute ? '+mute' : '')).join(', ')}]`);
-      return result;
-    } catch (e) {
-      console.error(`classifyBatch (попытка ${attempt}/2):`, e.message);
-      if (attempt === 2) {
-        console.error('classifyBatch: ИИ недоступен — весь батч уходит как "reg" (без блокировки).');
-        return fallback();
-      }
-    } finally {
-      clearTimeout(abortTimer);
     }
+    console.log(`classifyBatch: ${items.length} msg → [${[...result.values()].map(v => v.cat + (v.mute ? '+mute' : '')).join(', ')}]`);
+  } catch (e) {
+    console.error('classifyBatch:', e.message);
+  } finally {
+    clearTimeout(abortTimer);
   }
-  return fallback();
+  return result;
 }
 
 if (AI_API_KEY) console.log(`ИИ-фильтр включён (батчинг): ${AI_MODEL} @ ${AI_BASE_URL}`);
@@ -257,6 +188,28 @@ let db = { items: {}, mutes: {} };
 try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch {}
 if (!db.items) db.items = {};
 if (!db.mutes) db.mutes = {};
+
+// Автомиграция старых записей (bodyText + answers[] → messages[]) при старте.
+(function migrateInline() {
+  let changed = false;
+  for (const rec of Object.values(db.items)) {
+    if (Array.isArray(rec.messages)) continue;
+    const msgs = [];
+    const t0 = rec.createdAt || Date.now();
+    if (rec.bodyText && String(rec.bodyText).trim()) {
+      msgs.push({ from: 'user', by: rec.userMention || 'Пользователь', text: rec.bodyText, time: t0 });
+    }
+    (rec.answers || []).forEach((a, i) => {
+      msgs.push({ from: 'mod', by: a.by || 'Модерация', text: a.text || '', time: t0 + (i + 1) });
+    });
+    rec.messages = msgs;
+    if (rec.parentId === undefined) rec.parentId = null;
+    delete rec.bodyText;
+    delete rec.answers;
+    changed = true;
+  }
+  if (changed) console.log('Автомиграция data.json → формат чата выполнена.');
+})();
 
 let saveTimer = null;
 function persist() {
@@ -279,9 +232,8 @@ function genTicket(userId) {
   return (Date.now().toString(36) + Math.random().toString(36).slice(2, 4)).toUpperCase();
 }
 
-const MUTE_MS    = 15 * 60 * 1000;
-const AI_MUTE_MS =  2 * 60 * 1000; // мут за намеренный trash от ИИ-классификатора — короче, чем ручные нарушения
-function muteUser(userId, ms = MUTE_MS) { db.mutes[String(userId)] = Date.now() + ms; persist(); }
+const MUTE_MS = 15 * 60 * 1000;
+function muteUser(userId) { db.mutes[String(userId)] = Date.now() + MUTE_MS; persist(); }
 function mutedFor(userId) {
   const left = (db.mutes[String(userId)] || 0) - Date.now();
   return left > 0 ? left : 0;
@@ -297,7 +249,7 @@ function purgeExpiredMutes() {
 }
 
 // ======================= КЕШ МОДЕРАТОРОВ =======================
-const modCache = new Map(); // userId → { result, expiry }
+const modCache = new Map();
 const MOD_CACHE_TTL = 5 * 60 * 1000;
 
 async function isModerator(userId) {
@@ -316,7 +268,6 @@ const bot = new TelegramBot(TOKEN, { polling: false });
 const app = express();
 app.use(express.json());
 app.get('/webapp.html', (req, res) => res.sendFile(path.join(__dirname, 'webapp.html')));
-app.get('/my-tickets.html', (req, res) => res.sendFile(path.join(__dirname, 'my-tickets.html')));
 
 const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const clampCaption = (t) => (t.length > 1024 ? t.slice(0, 1015) + '…' : t);
@@ -325,56 +276,48 @@ const webAppUrl = (sid) => `https://t.me/${BOT_USERNAME}/${APP_NAME}?startapp=${
 const GREETING =
   '👋 <b>Привет!</b>\n\n' +
   'Напиши своё предложение, идею, вопрос, отзыв или деловое предложение <b>одним сообщением</b> — ' +
-  'я сам определю категорию и передам администрации. Ответ придёт сюда же.';
+  'я сам определю категорию и передам администрации. Дальше общение идёт в приложении-переписке.';
 
 const HOME_KB  = { inline_keyboard: [[{ text: '🔙 В начало', callback_data: 'home' }]] };
-const cancelKb = (sid) => ({ inline_keyboard: [[{ text: '❌ Отменить обращение', callback_data: `cancel:${sid}` }]] });
-
-// Кнопка отслеживания обращений — обычный web_app-button работает в личке
-// (в отличие от карточек в группе-модерации, см. README).
-const GREETING_KB = PUBLIC_URL
-  ? { inline_keyboard: [[{ text: '📋 Мои обращения', web_app: { url: `${PUBLIC_URL}/my-tickets.html` } }]] }
-  : undefined;
+// Кнопка открытия переписки в мини-приложении
+const openAppKb = (sid, label) => ({ inline_keyboard: [[{ text: label || '💬 Открыть переписку', url: webAppUrl(sid) }]] });
+// Для активного обращения подписчика: открыть переписку + отменить
+const userKb = (sid) => ({ inline_keyboard: [
+  [{ text: '💬 Открыть переписку', url: webAppUrl(sid) }],
+  [{ text: '❌ Отменить обращение', callback_data: `cancel:${sid}` }],
+] });
 
 function hasMedia(msg) {
   return !!(msg.photo || msg.video || msg.document || msg.voice || msg.audio ||
             msg.animation || msg.video_note || msg.sticker);
 }
 
-// ======================= КАРТОЧКА В МОДЕРАЦИИ =======================
+// ======================= КАРТОЧКА В МОДЕРАЦИИ (только уведомление) =======================
 function cardKeyboard(sid, state) {
-  if (state === 'new') {
-    return { inline_keyboard: [
-      [{ text: '✍️ Ответить', url: webAppUrl(sid) }],
-      [{ text: '🚫 Отклонить', callback_data: `reject:${sid}` }],
-    ] };
+  if (state === 'answered') {
+    return { inline_keyboard: [[{ text: '💬 Открыть переписку', url: webAppUrl(sid) }]] };
   }
-  if (state === 'processing') {
-    return { inline_keyboard: [
-      [{ text: '✍️ Открыть ответ', url: webAppUrl(sid) }],
-      [{ text: '🚫 Отклонить', callback_data: `reject:${sid}` }],
-    ] };
-  }
-  return { inline_keyboard: [[{ text: '➕ Дополнить ответ', url: webAppUrl(sid) }]] };
+  return { inline_keyboard: [
+    [{ text: state === 'processing' ? '💬 Открыть переписку' : '✍️ Ответить', url: webAppUrl(sid) }],
+    [{ text: '🚫 Отклонить', callback_data: `reject:${sid}` }],
+  ] };
 }
 
+// Карточка НЕ содержит текст обращения — только мета и счётчик сообщений.
 function cardText(rec) {
   const isBiz = rec.kind === 'biz';
-  const noun = isBiz ? 'деловое предложение' : 'предложение';
+  const noun = isBiz ? 'деловое предложение' : 'обращение';
   const gem  = isBiz ? '💎 ' : '';
-  const head = `👤 ${esc(rec.userMention)}  ·  🆔 <code>${rec.id}</code>\n<code>[user: ${rec.userId}]</code>`;
-  const body = esc(rec.bodyText) || '<i>(медиа без текста)</i>';
-  if (rec.state === 'new') {
-    return `${isBiz ? '💎' : '🟡'} <b>Новое ${noun}</b>\n${head}\n\n${body}`;
-  }
-  if (rec.state === 'processing') {
-    return `${gem}🟠 <b>Обрабатывается</b>\n${head}\n🖊 В работе: ${esc(rec.moderatorName)}\n\n${body}`;
-  }
-  let out = `${gem}🟢 <b>Обработано</b>\n${head}\n\n${body}`;
-  (rec.answers || []).forEach((a, i) => {
-    out += `\n\n💬 <b>${i === 0 ? 'Ответ' : 'Дополнение'} · ${esc(a.by)}</b>\n${esc(a.text)}`;
-  });
-  return out;
+  const ctx  = rec.parentId ? `\n🔁 Продолжение обращения <code>${rec.parentId}</code>` : '';
+  const head =
+    `👤 ${esc(rec.userMention)}  ·  🆔 <code>${rec.id}</code>\n` +
+    `<code>[user: ${rec.userId}]</code>${ctx}`;
+  const count = (rec.messages || []).length;
+  const foot = `\n\n💬 Сообщений в переписке: <b>${count}</b>\n<i>Текст — внутри приложения. Откройте, чтобы прочитать и ответить.</i>`;
+
+  if (rec.state === 'new')        return `${isBiz ? '💎' : '🟡'} <b>Новое ${noun}</b>\n${head}${foot}`;
+  if (rec.state === 'processing') return `${gem}🟠 <b>В работе</b> · ${esc(rec.moderatorName)}\n${head}${foot}`;
+  return `${gem}🟢 <b>Обработано</b> · ${esc(rec.moderatorName)}\n${head}${foot}`;
 }
 
 async function refreshCard(rec) {
@@ -413,8 +356,8 @@ async function relocateAnswered(rec) {
 // ======================= ОЧЕРЕДЬ =======================
 function queueText(rec, ahead) {
   const head = `✅ <b>Обращение принято</b>\n🆔 <code>${rec.id}</code>`;
-  if (ahead <= 0) return `${head}\n\n⏳ Вы <b>первый</b> в очереди — скоро ответим 💜`;
-  return `${head}\n\n⏳ Перед вами в очереди: <b>${ahead}</b>\n<i>Статус обновляется автоматически.</i>`;
+  if (ahead <= 0) return `${head}\n\n⏳ Вы <b>первый</b> в очереди — скоро ответим 💜\n<i>Общаться можно в приложении.</i>`;
+  return `${head}\n\n⏳ Перед вами в очереди: <b>${ahead}</b>\n<i>Статус обновляется автоматически. Переписка — в приложении.</i>`;
 }
 
 async function updateQueue() {
@@ -428,7 +371,7 @@ async function updateQueue() {
     if (rec.lastShownPos === i) continue;
     try {
       await bot.editMessageText(queueText(rec, i),
-        { chat_id: rec.userId, message_id: rec.userMsgId, parse_mode: 'HTML', reply_markup: cancelKb(rec.id) });
+        { chat_id: rec.userId, message_id: rec.userMsgId, parse_mode: 'HTML', reply_markup: userKb(rec.id) });
       rec.lastShownPos = i;
       persist();
     } catch {
@@ -458,13 +401,15 @@ async function createSuggestion(msg, kind) {
 
   const isText = !!msg.text && !hasMedia(msg);
   const isBiz = kind === 'biz';
+  const body = msg.text || msg.caption || '';
   const rec = {
     id: genTicket(from.id), kind: isBiz ? 'biz' : 'normal',
     userId: from.id, userMention: mention,
-    isMedia: !isText, bodyText: msg.text || msg.caption || '',
+    isMedia: !isText,
+    messages: body ? [{ from: 'user', by: mention, text: body, time: Date.now() }] : [],
     state: 'new', moderatorId: null, moderatorName: null, processingAt: null,
-    answers: [], modMessageId: null, userMsgId: null,
-    lastShownPos: null, createdAt: Date.now(),
+    modMessageId: null, userMsgId: null, lastShownPos: null,
+    createdAt: Date.now(), parentId: null,
   };
 
   try {
@@ -475,6 +420,7 @@ async function createSuggestion(msg, kind) {
     if (isText) {
       sent = await bot.sendMessage(MOD_CHAT_ID, cardText(rec), { parse_mode: 'HTML', reply_markup: kb, ...thread });
     } else {
+      // Медиа пересылаем (модераторам нужно его видеть), но подпись — только мета.
       sent = await bot.copyMessage(MOD_CHAT_ID, msg.chat.id, msg.message_id,
         { caption: clampCaption(cardText(rec)), parse_mode: 'HTML', reply_markup: kb, ...thread });
     }
@@ -484,13 +430,13 @@ async function createSuggestion(msg, kind) {
     let conf;
     if (isBiz) {
       conf = await bot.sendMessage(from.id,
-        `💎 <b>Деловое предложение принято</b>\n🆔 <code>${rec.id}</code>\n\nПередано администрации напрямую — с вами свяжутся.`,
-        { parse_mode: 'HTML', reply_markup: cancelKb(rec.id) });
+        `💎 <b>Деловое предложение принято</b>\n🆔 <code>${rec.id}</code>\n\nОткройте приложение, чтобы общаться с администрацией.`,
+        { parse_mode: 'HTML', reply_markup: userKb(rec.id) });
     } else {
       const ahead = store.all().filter(r =>
         r.kind !== 'biz' && (r.state === 'new' || r.state === 'processing') && r.createdAt < rec.createdAt).length;
       conf = await bot.sendMessage(from.id, queueText(rec, ahead),
-        { parse_mode: 'HTML', reply_markup: cancelKb(rec.id) });
+        { parse_mode: 'HTML', reply_markup: userKb(rec.id) });
       rec.lastShownPos = ahead;
     }
     rec.userMsgId = conf.message_id;
@@ -502,12 +448,42 @@ async function createSuggestion(msg, kind) {
   }
 }
 
+// Дополнение уже отвечённого обращения → новый тикет с контекстом.
+async function createFollowupTicket(parent, text) {
+  const rec = {
+    id: genTicket(parent.userId), kind: parent.kind === 'biz' ? 'biz' : 'normal',
+    userId: parent.userId, userMention: parent.userMention,
+    isMedia: false,
+    messages: [
+      ...(parent.messages || []).map(m => ({ ...m, ctx: true })),
+      { from: 'user', by: parent.userMention, text, time: Date.now() },
+    ],
+    state: 'new', moderatorId: null, moderatorName: null, processingAt: null,
+    modMessageId: null, userMsgId: null, lastShownPos: null,
+    createdAt: Date.now(), parentId: parent.id,
+  };
+  try {
+    const kb = cardKeyboard(rec.id, 'new');
+    const topic = rec.kind === 'biz' ? TOPIC_BIZ : TOPIC_NEW;
+    const thread = topic ? { message_thread_id: Number(topic) } : {};
+    const sent = await bot.sendMessage(MOD_CHAT_ID, cardText(rec), { parse_mode: 'HTML', reply_markup: kb, ...thread });
+    rec.modMessageId = sent.message_id;
+    store.set(rec);
+
+    const conf = await bot.sendMessage(rec.userId,
+      `🔁 <b>Обращение дополнено и отправлено заново</b>\n🆔 <code>${rec.id}</code>\n\nПрошлая переписка сохранена как контекст. Продолжайте в приложении.`,
+      { parse_mode: 'HTML', reply_markup: userKb(rec.id) }).catch(() => null);
+    if (conf) { rec.userMsgId = conf.message_id; store.set(rec); }
+    return rec;
+  } catch (e) { console.error('createFollowupTicket:', e.message); return null; }
+}
+
 async function rejectSuggestion(sid) {
   const rec = store.get(sid);
   if (!rec) return false;
   try { await bot.deleteMessage(MOD_CHAT_ID, rec.modMessageId); } catch (e) { console.error('reject del:', e.message); }
 
-  const wasAnswered = rec.state === 'answered' || (rec.answers && rec.answers.length > 0);
+  const wasAnswered = rec.state === 'answered' || (rec.messages || []).some(m => m.from === 'mod');
   if (!wasAnswered) {
     muteUser(rec.userId);
     try {
@@ -549,7 +525,7 @@ async function cancelSuggestion(sid, q) {
 // ======================= ХЭНДЛЕРЫ =======================
 bot.onText(/^\/start/, async (msg) => {
   if (msg.chat.type !== 'private') return;
-  await bot.sendMessage(msg.chat.id, GREETING, { parse_mode: 'HTML', reply_markup: GREETING_KB });
+  await bot.sendMessage(msg.chat.id, GREETING, { parse_mode: 'HTML' });
 });
 
 bot.on('message', async (msg) => {
@@ -562,7 +538,6 @@ bot.on('message', async (msg) => {
   if (msg.chat.type !== 'private') return;
   if (msg.text && msg.text.startsWith('/')) return;
 
-  // 1. Мут (от отклонения или спама)
   const muteLeft = mutedFor(msg.from.id);
   if (muteLeft > 0) {
     const mins = Math.ceil(muteLeft / 60000);
@@ -572,18 +547,17 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // 2. Одно активное обращение на пользователя
+  // Одно активное обращение: продолжать переписку нужно в приложении.
   const existing = store.all().find(r => String(r.userId) === String(msg.from.id) && r.state !== 'answered');
   if (existing) {
     await bot.sendMessage(msg.from.id,
-      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>\n\nДождитесь ответа или отмените его.`,
-      { parse_mode: 'HTML', reply_markup: cancelKb(existing.id) }).catch(() => {});
+      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>\n\nПродолжайте переписку в приложении или отмените обращение.`,
+      { parse_mode: 'HTML', reply_markup: userKb(existing.id) }).catch(() => {});
     return;
   }
 
   const textForAI = (msg.text || msg.caption || '').trim();
 
-  // 3. Проверка спама без ИИ (флуд + дубль)
   const spamReason = recordAndCheckSpam(msg.from.id, textForAI);
   if (spamReason) {
     muteUser(msg.from.id);
@@ -595,20 +569,11 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // 4. Медиа без текста → сразу как обычное, без LLM
   if (!textForAI) {
     await createSuggestion(msg, 'normal').catch(e => console.error('createSuggestion:', e.message));
     return;
   }
 
-  // 4.5 Явный мусор (однословные "привет"/"тест"/"ок" и т.п.) — отсекаем локально,
-  // не тратя вызов ИИ. Мгновенный ответ, без mute — пользователь мог просто ошибиться.
-  if (isObviousTrash(textForAI)) {
-    await bot.sendMessage(msg.from.id, TRASH_REPLY_TEXT, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
-    return;
-  }
-
-  // 5. Pending-ack только для первого сообщения в буфере от этого пользователя
   const alreadyWaiting = batchItems.some(it => it.msg.from.id === msg.from.id);
   if (!alreadyWaiting) {
     const ackMsg = await bot.sendMessage(msg.from.id, '⏳ <b>Получено</b> — определяем категорию...',
@@ -629,11 +594,10 @@ bot.on('callback_query', async (q) => {
       try {
         await bot.editMessageText(GREETING, {
           chat_id: q.message.chat.id, message_id: q.message.message_id, parse_mode: 'HTML',
-          reply_markup: GREETING_KB,
         });
       } catch (e) {
         if (!String(e.message).includes('message is not modified')) {
-          await bot.sendMessage(q.message.chat.id, GREETING, { parse_mode: 'HTML', reply_markup: GREETING_KB }).catch(() => {});
+          await bot.sendMessage(q.message.chat.id, GREETING, { parse_mode: 'HTML' }).catch(() => {});
         }
       }
       await bot.answerCallbackQuery(q.id);
@@ -673,105 +637,127 @@ function checkInitData(initData) {
   } catch { return null; }
 }
 
-async function authMiniApp(req, res) {
+// Проверяем только подпись — роль определяем по обращению.
+function authUser(req, res) {
   const user = checkInitData((req.body && req.body.initData) || '');
   if (!user || !user.id) { res.status(403).json({ error: 'Некорректная подпись' }); return null; }
-  if (!(await isModerator(user.id))) { res.status(403).json({ error: 'Вы не модератор' }); return null; }
   return user;
 }
 const modName = (u) => (u.username ? '@' + u.username : (u.first_name || 'модератор'));
 
-// Для мини-аппа подписчика модераторская проверка не нужна — только подпись initData.
-function authSubscriber(req, res) {
-  const user = checkInitData((req.body && req.body.initData) || '');
-  if (!user || !user.id) { res.status(403).json({ error: 'Некорректная подпись' }); return null; }
-  return user;
+// role: 'user' (владелец обращения) | 'mod' (админ группы) | null
+async function roleFor(rec, user) {
+  if (rec && String(rec.userId) === String(user.id)) return 'user';
+  if (await isModerator(user.id)) return 'mod';
+  return null;
+}
+
+function viewFor(rec, role, user) {
+  return {
+    id: rec.id,
+    kind: rec.kind,
+    role,
+    userMention: rec.userMention,
+    userId: rec.userId,
+    state: rec.state,
+    parentId: rec.parentId || null,
+    moderatorName: rec.moderatorName || null,
+    messages: (rec.messages || []).map(m => ({
+      from: m.from, by: m.by, text: m.text, time: m.time, ctx: !!m.ctx,
+    })),
+    // Модератор заблокирован, если обращение ведёт другой модератор и оно ещё не отвечено.
+    locked: role === 'mod' && rec.moderatorId &&
+            String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered',
+  };
 }
 
 // ======================= API МИНИ-ПРИЛОЖЕНИЯ =======================
 app.post('/api/open', async (req, res) => {
-  const user = await authMiniApp(req, res); if (!user) return;
+  const user = authUser(req, res); if (!user) return;
   const rec = store.get(req.body.sid);
-  if (!rec) return res.status(404).json({ error: 'Предложение уже обработано или удалено' });
+  if (!rec) return res.status(404).json({ error: 'Обращение не найдено или уже закрыто' });
 
-  if (rec.state === 'new') {
-    rec.state = 'processing';
-    rec.moderatorId = user.id;
-    rec.moderatorName = modName(user);
-    rec.processingAt = Date.now();
-    store.set(rec);
-    await refreshCard(rec);
+  const role = await roleFor(rec, user);
+  if (!role) return res.status(403).json({ error: 'Нет доступа к этому обращению' });
+
+  if (role === 'mod') {
+    if (rec.state === 'new') {
+      rec.state = 'processing';
+      rec.moderatorId = user.id;
+      rec.moderatorName = modName(user);
+      rec.processingAt = Date.now();
+      store.set(rec);
+      await refreshCard(rec);
+    } else if (rec.state === 'processing' && String(rec.moderatorId) === String(user.id)) {
+      rec.processingAt = Date.now();
+      store.set(rec);
+    }
   }
-  const answersText = (rec.answers || [])
-    .map((a, i) => `${i === 0 ? 'Ответ' : 'Дополнение'} (${a.by}): ${a.text}`).join('\n\n');
-  res.json({
-    id: rec.id, kind: rec.kind, userMention: rec.userMention, bodyText: rec.bodyText,
-    isMedia: rec.isMedia, state: rec.state, answersText, moderatorName: rec.moderatorName,
-    busy: rec.state === 'answered' || (rec.moderatorId && rec.moderatorId !== user.id),
-  });
+
+  res.json(viewFor(rec, role, user));
 });
 
-app.post('/api/answer', async (req, res) => {
-  const user = await authMiniApp(req, res); if (!user) return;
+app.post('/api/send', async (req, res) => {
+  const user = authUser(req, res); if (!user) return;
   const rec = store.get(req.body.sid);
-  if (!rec) return res.status(404).json({ error: 'Предложение уже обработано или удалено' });
-  const answer = String(req.body.text || '').trim();
-  if (!answer) return res.status(400).json({ error: 'Пустой ответ' });
-  if (answer.length > 3500) return res.status(400).json({ error: 'Слишком длинный ответ' });
+  if (!rec) return res.status(404).json({ error: 'Обращение не найдено или уже закрыто' });
 
-  const isFirst = rec.state !== 'answered';
+  const role = await roleFor(rec, user);
+  if (!role) return res.status(403).json({ error: 'Нет доступа к этому обращению' });
 
-  try {
-    await bot.sendMessage(rec.userId,
-      `💬 <b>${isFirst ? 'Ответ администрации' : 'Дополнение к ответу'}</b>\n🆔 <code>${rec.id}</code>\n\n${esc(answer)}`,
-      { parse_mode: 'HTML', reply_markup: HOME_KB });
-  } catch (e) {
-    console.error('deliver:', e.message);
-    return res.status(502).json({ error: 'Не удалось доставить — возможно, пользователь заблокировал бота' });
-  }
+  const text = String(req.body.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Пустое сообщение' });
+  if (text.length > 3500) return res.status(400).json({ error: 'Слишком длинное сообщение' });
 
-  rec.answers = rec.answers || [];
-  rec.answers.push({ text: answer, by: modName(user) });
-  rec.moderatorName = modName(user);
-  if (isFirst) rec.state = 'answered';
-  store.set(rec);
+  if (role === 'mod') {
+    // Лок: другой модератор уже ведёт неотвеченное обращение.
+    if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
+      return res.status(409).json({ error: 'Обращение уже обрабатывает другой модератор' });
+    }
+    const isFirst = rec.state !== 'answered';
+    rec.messages = rec.messages || [];
+    rec.messages.push({ from: 'mod', by: modName(user), text, time: Date.now() });
+    rec.moderatorId = user.id;
+    rec.moderatorName = modName(user);
+    if (isFirst) rec.state = 'answered';
+    store.set(rec);
 
-  if (isFirst) {
-    if (rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateAnswered(rec);
+    // Уведомление подписчику — без текста ответа.
+    try {
+      await bot.sendMessage(rec.userId,
+        `💬 <b>Вам ответили</b>\n🆔 <code>${rec.id}</code>\n\nОткройте переписку, чтобы прочитать и продолжить.`,
+        { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) });
+    } catch (e) { console.error('deliver:', e.message); }
+
+    if (isFirst && rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateAnswered(rec);
     else await refreshCard(rec);
-  } else {
-    await refreshCard(rec);
+
+    res.json(viewFor(rec, 'mod', user));
+    updateQueue().catch(() => {});
+    return;
   }
 
-  res.json({ ok: true });
-  updateQueue().catch(() => {});
+  // role === 'user'
+  // Правило: если уже отвечено (лежит в «просмотренных») — уходит как новое с контекстом.
+  if (rec.state === 'answered') {
+    const child = await createFollowupTicket(rec, text);
+    if (!child) return res.status(500).json({ error: 'Не удалось создать обращение' });
+    return res.json({ ...viewFor(child, 'user', user), switchTo: child.id });
+  }
+
+  // Живая переписка (new/processing) — просто дополняем ленту.
+  rec.messages = rec.messages || [];
+  rec.messages.push({ from: 'user', by: rec.userMention, text, time: Date.now() });
+  store.set(rec);
+  await refreshCard(rec);
+  res.json(viewFor(rec, 'user', user));
 });
 
 app.post('/api/reject', async (req, res) => {
-  const user = await authMiniApp(req, res); if (!user) return;
+  const user = authUser(req, res); if (!user) return;
+  if (!(await isModerator(user.id))) return res.status(403).json({ error: 'Вы не модератор' });
   await rejectSuggestion(req.body.sid);
   res.json({ ok: true });
-});
-
-app.post('/api/my-tickets', (req, res) => {
-  const user = authSubscriber(req, res); if (!user) return;
-
-  const tickets = store.all()
-    .filter(r => String(r.userId) === String(user.id))
-    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-    .map(r => ({
-      id: r.id,
-      kind: r.kind,
-      state: r.state,
-      bodyText: r.bodyText,
-      isMedia: r.isMedia,
-      answersText: (r.answers || []).length
-        ? r.answers.map((a, i) => `${i === 0 ? 'Ответ' : 'Дополнение'} (${a.by}): ${a.text}`).join('\n\n')
-        : null,
-      createdAt: r.createdAt,
-    }));
-
-  res.json({ tickets });
 });
 
 // ======================= WEBHOOK И ЗАПУСК =======================
@@ -782,7 +768,6 @@ app.post(`/bot${TOKEN}`, (req, res) => {
   res.sendStatus(200);
 });
 
-// сброс буфера при перезапуске (Render SIGTERM)
 process.on('SIGTERM', async () => {
   console.log('SIGTERM: сбрасываю буфер перед завершением...');
   if (batchItems.length) {
