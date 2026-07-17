@@ -22,6 +22,36 @@ if (!TOKEN || !MOD_CHAT_ID || !BOT_USERNAME || !APP_NAME) {
   process.exit(1);
 }
 
+// ======================= ДЕТЕКТОР СПАМА (без ИИ) =======================
+// Два независимых правила: флуд и повтор фразы.
+const userMsgLog   = new Map(); // userId → [timestamp, ...]  (для флуда)
+const userLastText = new Map(); // userId → { text, time }    (для дублей)
+
+const SPAM_FLOOD_WINDOW = 30  * 1000; // окно флуда, мс
+const SPAM_FLOOD_LIMIT  = 5;          // >5 сообщений в окне = флуд
+const SPAM_DUP_WINDOW   = 2  * 60 * 1000; // повтор той же фразы в течение 2 мин
+
+// Возвращает 'flood' | 'duplicate' | null
+function recordAndCheckSpam(userId, text) {
+  const uid = String(userId);
+  const now = Date.now();
+
+  // Флуд
+  const log = (userMsgLog.get(uid) || []).filter(t => now - t < SPAM_FLOOD_WINDOW);
+  log.push(now);
+  userMsgLog.set(uid, log);
+  if (log.length > SPAM_FLOOD_LIMIT) return 'flood';
+
+  // Дубль (только для текстовых сообщений)
+  if (text) {
+    const last = userLastText.get(uid);
+    if (last && last.text === text && now - last.time < SPAM_DUP_WINDOW) return 'duplicate';
+    userLastText.set(uid, { text, time: now });
+  }
+
+  return null;
+}
+
 // ======================= ИИ-КЛАССИФИКАЦИЯ (батчинг + дебаунс) =======================
 // Провайдер задаётся env — сменить без правки кода:
 //   OpenRouter: AI_BASE_URL=https://openrouter.ai/api/v1  AI_MODEL=meta-llama/llama-3.3-70b-instruct:free
@@ -35,14 +65,18 @@ const AI_SYSTEM =
   'Classify messages sent to a public feedback/suggestion bot.\n' +
   'Categories:\n' +
   '- "trash": zero actionable substance — cannot be meaningfully responded to.\n' +
-  '  IS trash: keyboard mashing (asdf, 123456, ///), random chars, pure profanity with no real complaint behind it, single filler words (test/hi/ok/lol/привет/?/!), emoji-only, "testing 123".\n' +
-  '  NOT trash: rude-but-real feedback ("всё говно", "ужасный сервис"), vague negatives ("всё плохо"), very short real questions ("цена?", "когда?", "где?").\n' +
+  '  IS trash: keyboard mashing (asdf, 123456, ///), random chars, pure profanity with no complaint, single filler words (test/hi/ok/lol/привет/?/!), emoji-only chains.\n' +
+  '  NOT trash: rude-but-real feedback ("всё говно", "ужасный сервис"), vague negatives ("всё плохо"), short real questions ("цена?", "когда?", "где?").\n' +
   '- "biz": business proposals, ads, partnerships, commercial offers.\n' +
-  '- "reg": everything else — questions, feedback, bugs, suggestions, complaints, even if vague, emotional, or very short.\n' +
+  '- "reg": everything else — questions, feedback, bugs, suggestions, complaints, even if vague or emotional.\n' +
+  'For trash only — set "mute": true if the message shows DELIBERATE malice: targeted insults, hate, threats, intentional spam flooding, or repeated nonsense after a warning.\n' +
+  'Set "mute": false if the message is just unclear, meaningless, or unintentional (user likely confused or testing).\n' +
+  'When trash+mute=false: fill "reply" with a polite Russian request to rephrase.\n' +
+  'When trash+mute=true or cat!=trash: leave "reply" empty.\n' +
   'When unsure between trash and reg → choose reg.\n' +
   'Input: [{"id":1,"text":"..."}]\n' +
   'Output only valid JSON, no markdown:\n' +
-  '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","reply":"polite Russian rephrase request (ONLY if trash, else empty string)"}]}';
+  '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","mute":false,"reply":"..."}]}';
 
 // Параметры дебаунс-буфера
 const DEBOUNCE_FIRST = 15000;
@@ -80,15 +114,24 @@ async function flushBatch() {
   const classMap = await classifyBatch(aiItems);
 
   for (const { id, msg } of items) {
-    const { cat, reply } = classMap.get(id) || { cat: 'reg', reply: '' };
+    const { cat, mute, reply } = classMap.get(id) || { cat: 'reg', mute: false, reply: '' };
 
     await deletePendingAck(msg.from.id);
 
     if (cat === 'trash') {
-      const text = (reply && reply.trim())
-        ? reply
-        : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
-      await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+      if (mute) {
+        // Намеренное нарушение — мут 15 минут
+        muteUser(msg.from.id);
+        await bot.sendMessage(msg.from.id,
+          '🚫 <b>Сообщение нарушает правила.</b>\n\nОтправка заблокирована на <b>15 минут</b>.',
+          { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+      } else {
+        // Непонятное сообщение — просим переформулировать
+        const text = (reply && reply.trim())
+          ? reply
+          : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
+        await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+      }
     } else {
       const kind = cat === 'biz' ? 'biz' : 'normal';
       await createSuggestion(msg, kind).catch(e => console.error('createSuggestion:', e.message));
@@ -105,7 +148,7 @@ function scheduleBatch() {
 }
 
 async function classifyBatch(items) {
-  const result = new Map(items.map(i => [i.id, { cat: 'reg', reply: '' }]));
+  const result = new Map(items.map(i => [i.id, { cat: 'reg', mute: false, reply: '' }]));
   if (!AI_API_KEY || !items.length) return result;
   const ctrl = new AbortController();
   const abortTimer = setTimeout(() => ctrl.abort(), 20000);
@@ -114,7 +157,7 @@ async function classifyBatch(items) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
       body: JSON.stringify({
-        model: AI_MODEL, temperature: 0, max_tokens: 80 * items.length + 50,
+        model: AI_MODEL, temperature: 0, max_tokens: 100 * items.length + 50,
         messages: [
           { role: 'system', content: AI_SYSTEM },
           { role: 'user', content: JSON.stringify(items) },
@@ -130,9 +173,16 @@ async function classifyBatch(items) {
     const parsed = JSON.parse(jsonMatch[0]);
     const VALID = new Set(['trash', 'biz', 'reg']);
     for (const r of (parsed.results || [])) {
-      if (result.has(r.id)) result.set(r.id, { cat: VALID.has(r.cat) ? r.cat : 'reg', reply: String(r.reply || '') });
+      if (result.has(r.id)) {
+        const cat = VALID.has(r.cat) ? r.cat : 'reg';
+        result.set(r.id, {
+          cat,
+          mute:  cat === 'trash' && r.mute === true,
+          reply: String(r.reply || ''),
+        });
+      }
     }
-    console.log(`classifyBatch: ${items.length} msg → [${[...result.values()].map(v => v.cat).join(', ')}]`);
+    console.log(`classifyBatch: ${items.length} msg → [${[...result.values()].map(v => v.cat + (v.mute ? '+mute' : '')).join(', ')}]`);
   } catch (e) {
     console.error('classifyBatch:', e.message);
   } finally {
@@ -447,16 +497,17 @@ bot.on('message', async (msg) => {
   if (msg.chat.type !== 'private') return;
   if (msg.text && msg.text.startsWith('/')) return;
 
+  // 1. Мут (от отклонения или спама)
   const muteLeft = mutedFor(msg.from.id);
   if (muteLeft > 0) {
     const mins = Math.ceil(muteLeft / 60000);
     await bot.sendMessage(msg.from.id,
-      `⛔ <b>Вы недавно получили отказ.</b>\nОтправить новое обращение можно через ~${mins} мин.`,
+      `⛔ <b>Отправка заблокирована.</b>\nПопробуйте через ~${mins} мин.`,
       { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
     return;
   }
 
-  // один пользователь — одно активное обращение
+  // 2. Одно активное обращение на пользователя
   const existing = store.all().find(r => String(r.userId) === String(msg.from.id) && r.state !== 'answered');
   if (existing) {
     await bot.sendMessage(msg.from.id,
@@ -467,13 +518,25 @@ bot.on('message', async (msg) => {
 
   const textForAI = (msg.text || msg.caption || '').trim();
 
-  // Медиа без текста → сразу как обычное, без LLM.
+  // 3. Проверка спама без ИИ (флуд + дубль)
+  const spamReason = recordAndCheckSpam(msg.from.id, textForAI);
+  if (spamReason) {
+    muteUser(msg.from.id);
+    const spamText = spamReason === 'flood'
+      ? '⚠️ <b>Слишком много сообщений подряд.</b>\n\nОтправка заблокирована на <b>15 минут</b>.'
+      : '⚠️ <b>Повторяющееся сообщение.</b>\n\nНе нужно отправлять одно и то же. Отправка заблокирована на <b>15 минут</b>.';
+    await bot.sendMessage(msg.from.id, spamText, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+    console.log(`spam(${spamReason}): user ${msg.from.id} muted`);
+    return;
+  }
+
+  // 4. Медиа без текста → сразу как обычное, без LLM
   if (!textForAI) {
     await createSuggestion(msg, 'normal').catch(e => console.error('createSuggestion:', e.message));
     return;
   }
 
-  // Pending-ack только для первого сообщения в буфере от этого пользователя.
+  // 5. Pending-ack только для первого сообщения в буфере от этого пользователя
   const alreadyWaiting = batchItems.some(it => it.msg.from.id === msg.from.id);
   if (!alreadyWaiting) {
     const ackMsg = await bot.sendMessage(msg.from.id, '⏳ <b>Получено</b> — определяем категорию...',
