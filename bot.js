@@ -24,6 +24,8 @@ if (!TOKEN || !MOD_CHAT_ID || !BOT_USERNAME || !APP_NAME) {
 
 // Подписчик всегда видит ответ «от Администрации» — личный юзернейм/имя модератора не раскрываем.
 const MOD_LABEL = 'Администрация';
+// Через сколько после последнего ответа админа можно обработать без ответа пользователя.
+const CLOSE_DELAY_MS = 60 * 60 * 1000;
 
 // ======================= ДЕТЕКТОР СПАМА (без ИИ) =======================
 const userMsgLog   = new Map();
@@ -219,26 +221,35 @@ try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch {}
 if (!db.items) db.items = {};
 if (!db.mutes) db.mutes = {};
 
-// Автомиграция старых записей (bodyText + answers[] → messages[]) при старте.
+// Автомиграция старых записей при старте:
+//  - bodyText + answers[] → messages[]
+//  - прежнее состояние 'answered' (авто-закрытие) → 'closed' (обработано вручную/исторически)
 (function migrateInline() {
   let changed = false;
   for (const rec of Object.values(db.items)) {
-    if (Array.isArray(rec.messages)) continue;
-    const msgs = [];
-    const t0 = rec.createdAt || Date.now();
-    if (rec.bodyText && String(rec.bodyText).trim()) {
-      msgs.push({ from: 'user', by: rec.userMention || 'Пользователь', text: rec.bodyText, time: t0 });
+    if (!Array.isArray(rec.messages)) {
+      const msgs = [];
+      const t0 = rec.createdAt || Date.now();
+      if (rec.bodyText && String(rec.bodyText).trim()) {
+        msgs.push({ from: 'user', by: rec.userMention || 'Пользователь', text: rec.bodyText, time: t0 });
+      }
+      (rec.answers || []).forEach((a, i) => {
+        msgs.push({ from: 'mod', by: MOD_LABEL, text: a.text || '', time: t0 + (i + 1) });
+      });
+      rec.messages = msgs;
+      if (rec.parentId === undefined) rec.parentId = null;
+      delete rec.bodyText;
+      delete rec.answers;
+      changed = true;
     }
-    (rec.answers || []).forEach((a, i) => {
-      msgs.push({ from: 'mod', by: MOD_LABEL, text: a.text || '', time: t0 + (i + 1) });
-    });
-    rec.messages = msgs;
-    if (rec.parentId === undefined) rec.parentId = null;
-    delete rec.bodyText;
-    delete rec.answers;
-    changed = true;
+    if (rec.state === 'answered' && !rec._v2) {
+      // В старой модели 'answered' означало «закрыто и в просмотренных» → теперь это 'closed'.
+      rec.state = 'closed';
+      changed = true;
+    }
+    if (!rec._v2) { rec._v2 = true; changed = true; }
   }
-  if (changed) console.log('Автомиграция data.json → формат чата выполнена.');
+  if (changed) console.log('Автомиграция data.json выполнена.');
 })();
 
 let saveTimer = null;
@@ -320,10 +331,33 @@ function hasMedia(msg) {
             msg.animation || msg.video_note || msg.sticker);
 }
 
+// Реальные (не контекстные) сообщения обращения.
+function realMsgs(rec) { return (rec.messages || []).filter(m => !m.ctx); }
+
+// Может ли модератор обработать (закрыть) обращение прямо сейчас.
+function canModClose(rec) {
+  const real = realMsgs(rec);
+  const modMsgs = real.filter(m => m.from === 'mod');
+  if (!modMsgs.length) return { ok: false, reason: 'Нельзя обработать: сначала ответьте пользователю.' };
+  const lastMod = modMsgs[modMsgs.length - 1];
+  const userAfter = real.some(m => m.from === 'user' && m.time > lastMod.time);
+  const elapsed = Date.now() - lastMod.time;
+  if (userAfter || elapsed >= CLOSE_DELAY_MS) return { ok: true, reason: '' };
+  const leftMin = Math.ceil((CLOSE_DELAY_MS - elapsed) / 60000);
+  return { ok: false, reason: `Пока нельзя обработать: дождитесь ответа пользователя или подождите ещё ~${leftMin} мин.` };
+}
+
 // ======================= КАРТОЧКА В МОДЕРАЦИИ (только уведомление) =======================
 function cardKeyboard(sid, state) {
-  if (state === 'answered') {
+  if (state === 'closed') {
     return { inline_keyboard: [[{ text: '💬 Открыть переписку', url: webAppUrl(sid) }]] };
+  }
+  if (state === 'answered') {
+    return { inline_keyboard: [
+      [{ text: '💬 Открыть переписку', url: webAppUrl(sid) }],
+      [{ text: '✅ Обработать', callback_data: `close:${sid}` }],
+      [{ text: '🚫 Отклонить', callback_data: `reject:${sid}` }],
+    ] };
   }
   return { inline_keyboard: [
     [{ text: state === 'processing' ? '💬 Открыть переписку' : '✍️ Ответить', url: webAppUrl(sid) }],
@@ -340,7 +374,7 @@ function cardText(rec) {
   const head =
     `👤 ${esc(rec.userMention)}  ·  🆔 <code>${rec.id}</code>\n` +
     `<code>[user: ${rec.userId}]</code>${ctx}`;
-  const real = (rec.messages || []).filter(m => !m.ctx);
+  const real = realMsgs(rec);
   const fromUser = real.filter(m => m.from === 'user').length;
   const fromMod  = real.filter(m => m.from === 'mod').length;
   const foot = `\n\n💬 Сообщений: <b>${real.length}</b> (👤 ${fromUser} · 🛡 ${fromMod})\n` +
@@ -348,7 +382,14 @@ function cardText(rec) {
 
   if (rec.state === 'new')        return `${isBiz ? '💎' : '🟡'} <b>Новое ${noun}</b>\n${head}${foot}`;
   if (rec.state === 'processing') return `${gem}🟠 <b>В работе</b> · ${esc(rec.moderatorName)}\n${head}${foot}`;
-  return `${gem}🟢 <b>Обработано</b> · ${esc(rec.moderatorName)}\n${head}${foot}`;
+  if (rec.state === 'answered') {
+    const g = canModClose(rec);
+    const gateLine = g.ok ? '\n✅ <b>Можно обработать</b>' : '\n⏳ <i>' + esc(g.reason) + '</i>';
+    return `${gem}🔵 <b>Отвечено · идёт диалог</b>\n${head}${foot}${gateLine}`;
+  }
+  const byLine = rec.closedBy === 'user' ? ' · закрыл пользователь'
+               : rec.closedBy === 'mod'  ? ' · закрыла администрация' : '';
+  return `${gem}🟢 <b>Обработано</b>${byLine}\n${head}${foot}`;
 }
 
 async function refreshCard(rec) {
@@ -364,8 +405,9 @@ async function refreshCard(rec) {
   }
 }
 
-async function relocateAnswered(rec) {
-  const kb = cardKeyboard(rec.id, 'answered');
+// Перенос карточки в тему «Обработанные» (при закрытии обращения).
+async function relocateToAnswered(rec) {
+  const kb = cardKeyboard(rec.id, 'closed');
   const text = cardText(rec);
   try {
     let sent;
@@ -381,7 +423,7 @@ async function relocateAnswered(rec) {
     store.set(rec);
     try { await bot.deleteMessage(MOD_CHAT_ID, oldId); } catch {}
   } catch (e) {
-    console.error('relocateAnswered:', e.message);
+    console.error('relocateToAnswered:', e.message);
     await refreshCard(rec);
   }
 }
@@ -425,6 +467,15 @@ async function releaseStale() {
   }
 }
 
+// Периодически обновляем карточки в диалоге, чтобы «⏳ ещё N мин» / «✅ Можно обработать» были актуальны.
+async function refreshDialogCards() {
+  for (const rec of store.all()) {
+    if (rec.state !== 'answered') continue;
+    const g = canModClose(rec);
+    if (g.ok && rec._gateOk !== true) { rec._gateOk = true; await refreshCard(rec); persist(); }
+  }
+}
+
 // ======================= ПРИЁМ ПРЕДЛОЖЕНИЯ =======================
 async function createSuggestion(msg, kind) {
   const from = msg.from;
@@ -442,7 +493,7 @@ async function createSuggestion(msg, kind) {
     messages: body ? [{ from: 'user', by: mention, text: body, time: Date.now() }] : [],
     state: 'new', moderatorId: null, moderatorName: null, processingAt: null,
     modMessageId: null, userMsgId: null, lastShownPos: null,
-    createdAt: Date.now(), parentId: null,
+    createdAt: Date.now(), parentId: null, _v2: true,
   };
 
   try {
@@ -480,7 +531,7 @@ async function createSuggestion(msg, kind) {
   }
 }
 
-// Дополнение уже отвечённого обращения → новый тикет с контекстом.
+// Дополнение уже ОБРАБОТАННОГО (closed) обращения → новый тикет с контекстом.
 async function createFollowupTicket(parent, text) {
   const rec = {
     id: genTicket(parent.userId), kind: parent.kind === 'biz' ? 'biz' : 'normal',
@@ -492,7 +543,7 @@ async function createFollowupTicket(parent, text) {
     ],
     state: 'new', moderatorId: null, moderatorName: null, processingAt: null,
     modMessageId: null, userMsgId: null, lastShownPos: null,
-    createdAt: Date.now(), parentId: parent.id,
+    createdAt: Date.now(), parentId: parent.id, _v2: true,
   };
   try {
     const kb = cardKeyboard(rec.id, 'new');
@@ -510,26 +561,41 @@ async function createFollowupTicket(parent, text) {
   } catch (e) { console.error('createFollowupTicket:', e.message); return null; }
 }
 
-// Общая логика ответа модератора — из мини-аппа И из реплая в группе. Всегда обезличено.
+// Ответ модератора — из мини-аппа И из реплая в группе. Обезличено; обращение НЕ закрывается.
 async function applyModAnswer(rec, modUser, text) {
-  const isFirst = rec.state !== 'answered';
   rec.messages = rec.messages || [];
   rec.messages.push({ from: 'mod', by: MOD_LABEL, text, time: Date.now() });
   rec.moderatorId = modUser.id;
   rec.moderatorName = MOD_LABEL;
-  if (isFirst) rec.state = 'answered';
+  rec.state = 'answered';      // диалог открыт; закрытие — только вручную
+  rec._gateOk = false;
   store.set(rec);
 
-  // Подписчику — уведомление без текста.
   try {
     await bot.sendMessage(rec.userId,
       `💬 <b>Вам ответили</b>\n🆔 <code>${rec.id}</code>\n\nОткройте переписку, чтобы прочитать и продолжить.`,
       { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) });
   } catch (e) { console.error('deliver:', e.message); }
 
-  if (isFirst && rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateAnswered(rec);
-  else await refreshCard(rec);
+  await refreshCard(rec);
+  updateQueue().catch(() => {});
+}
 
+// Ручное закрытие/обработка обращения. by = 'user' | 'mod'.
+async function closeSuggestion(rec, by) {
+  rec.state = 'closed';
+  rec.closedBy = by;
+  rec.processingAt = null;
+  store.set(rec);
+
+  if (by === 'mod') {
+    await bot.sendMessage(rec.userId,
+      `✅ <b>Обращение обработано</b>\n🆔 <code>${rec.id}</code>\n\nСпасибо! Если появится новый вопрос — просто напишите, и мы учтём эту переписку.`,
+      { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) }).catch(() => {});
+  }
+
+  if (rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateToAnswered(rec);
+  else await refreshCard(rec);
   updateQueue().catch(() => {});
 }
 
@@ -538,8 +604,7 @@ async function rejectSuggestion(sid) {
   if (!rec) return false;
   try { await bot.deleteMessage(MOD_CHAT_ID, rec.modMessageId); } catch (e) { console.error('reject del:', e.message); }
 
-  // «Отвечено» = есть реальный (не контекстный) ответ модератора.
-  const wasAnswered = (rec.messages || []).some(m => m.from === 'mod' && !m.ctx);
+  const wasAnswered = realMsgs(rec).some(m => m.from === 'mod');
   if (!wasAnswered) {
     muteUser(rec.userId);
     try {
@@ -559,8 +624,9 @@ async function cancelSuggestion(sid, q) {
   if (!rec || rec.userId !== q.from.id) {
     await bot.answerCallbackQuery(q.id, { text: 'Обращение недоступно' }); return;
   }
-  if (rec.state === 'answered') {
-    await bot.answerCallbackQuery(q.id, { text: 'На обращение уже ответили' }); return;
+  // Отменить (удалить) можно только пока нет ответа админа.
+  if (realMsgs(rec).some(m => m.from === 'mod') || rec.state === 'closed') {
+    await bot.answerCallbackQuery(q.id, { text: 'Есть ответ — используйте «Завершить» в приложении' }); return;
   }
 
   try { await bot.deleteMessage(MOD_CHAT_ID, rec.modMessageId); } catch {}
@@ -587,10 +653,10 @@ async function handleModGroupReply(msg) {
 
   const rec = store.all().find(r => r.modMessageId === replyTo.message_id);
   if (!rec) return;                      // реплай не на карточку — игнор
+  if (rec.state === 'closed') return;    // обработанное не трогаем
   if (!(await isModerator(msg.from.id))) return;
 
   await applyModAnswer(rec, msg.from, body).catch(e => console.error('groupReply:', e.message));
-  // Убираем текст из группы — он теперь в приложении.
   try { await bot.deleteMessage(MOD_CHAT_ID, msg.message_id); } catch {}
 }
 
@@ -625,12 +691,14 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Одно активное обращение: продолжать переписку нужно в приложении.
-  const existing = store.all().find(r => String(r.userId) === String(msg.from.id) && r.state !== 'answered');
+  // Одно активное обращение (всё, что не 'closed'): продолжать переписку нужно в приложении.
+  const existing = store.all().find(r => String(r.userId) === String(msg.from.id) && r.state !== 'closed');
   if (existing) {
+    const kb = (existing.state === 'new' || existing.state === 'processing')
+      ? userKb(existing.id) : openAppKb(existing.id);
     await bot.sendMessage(msg.from.id,
-      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>\n\nПродолжайте переписку в приложении или отмените обращение.`,
-      { parse_mode: 'HTML', reply_markup: userKb(existing.id) }).catch(() => {});
+      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>\n\nПродолжайте переписку в приложении.`,
+      { parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
     return;
   }
 
@@ -667,6 +735,7 @@ bot.on('message', async (msg) => {
 
 bot.on('callback_query', async (q) => {
   const data = q.data || '';
+  const sid = data.includes(':') ? data.split(':')[1] : '';
   try {
     if (data === 'home') {
       try {
@@ -681,14 +750,25 @@ bot.on('callback_query', async (q) => {
       await bot.answerCallbackQuery(q.id);
 
     } else if (data.startsWith('cancel:')) {
-      await cancelSuggestion(data.split(':')[1], q);
+      await cancelSuggestion(sid, q);
 
     } else if (data.startsWith('reject:')) {
       if (!(await isModerator(q.from.id))) {
         await bot.answerCallbackQuery(q.id, { text: 'Доступно только модераторам' }); return;
       }
-      const ok = await rejectSuggestion(data.split(':')[1]);
+      const ok = await rejectSuggestion(sid);
       await bot.answerCallbackQuery(q.id, { text: ok ? 'Отклонено и удалено 🚫' : 'Уже обработано' });
+
+    } else if (data.startsWith('close:')) {
+      if (!(await isModerator(q.from.id))) {
+        await bot.answerCallbackQuery(q.id, { text: 'Доступно только модераторам' }); return;
+      }
+      const rec = store.get(sid);
+      if (!rec || rec.state === 'closed') { await bot.answerCallbackQuery(q.id, { text: 'Уже обработано' }); return; }
+      const gate = canModClose(rec);
+      if (!gate.ok) { await bot.answerCallbackQuery(q.id, { text: gate.reason, show_alert: true }); return; }
+      await closeSuggestion(rec, 'mod');
+      await bot.answerCallbackQuery(q.id, { text: 'Обработано ✅' });
 
     } else {
       await bot.answerCallbackQuery(q.id);
@@ -728,6 +808,7 @@ async function roleFor(rec, user) {
 }
 
 function viewFor(rec, role, user) {
+  const modGate = role === 'mod' ? canModClose(rec) : { ok: true, reason: '' };
   return {
     id: rec.id,
     kind: rec.kind,
@@ -737,12 +818,17 @@ function viewFor(rec, role, user) {
     state: rec.state,
     parentId: rec.parentId || null,
     moderatorName: rec.moderatorName || null,
-    messages: (rec.messages || []).map(m => ({
-      from: m.from, by: m.by, text: m.text, time: m.time, ctx: !!m.ctx,
-    })),
+    messages: realMsgsAndCtx(rec),
     locked: role === 'mod' && rec.moderatorId &&
-            String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered',
+            String(rec.moderatorId) !== String(user.id) && rec.state !== 'closed',
+    closed: rec.state === 'closed',
+    closable: rec.state === 'answered',          // «Завершить/Обработать» доступно в диалоге
+    closeEnabled: role === 'user' ? true : modGate.ok,
+    closeHint: role === 'mod' ? modGate.reason : '',
   };
+}
+function realMsgsAndCtx(rec) {
+  return (rec.messages || []).map(m => ({ from: m.from, by: m.by, text: m.text, time: m.time, ctx: !!m.ctx }));
 }
 
 // ======================= API МИНИ-ПРИЛОЖЕНИЯ =======================
@@ -785,6 +871,7 @@ app.post('/api/send', async (req, res) => {
 
   // ---- Модератор ----
   if (role === 'mod') {
+    if (rec.state === 'closed') return res.status(409).json({ error: 'Обращение уже обработано' });
     if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
       return res.status(409).json({ error: 'Обращение уже обрабатывает другой модератор' });
     }
@@ -798,9 +885,9 @@ app.post('/api/send', async (req, res) => {
     return res.status(403).json({ error: `Отправка заблокирована. Попробуйте через ~${Math.ceil(muteLeft / 60000)} мин.` });
   }
 
-  if (rec.state === 'answered') {
-    // Не плодим дубликаты: если уже есть активное обращение — пишем в него.
-    const active = store.all().find(r => String(r.userId) === String(user.id) && r.state !== 'answered');
+  // Обработанное (closed) → новое обращение с контекстом.
+  if (rec.state === 'closed') {
+    const active = store.all().find(r => String(r.userId) === String(user.id) && r.state !== 'closed');
     if (active) {
       active.messages = active.messages || [];
       active.messages.push({ from: 'user', by: active.userMention, text, time: Date.now() });
@@ -813,12 +900,34 @@ app.post('/api/send', async (req, res) => {
     return res.json({ ...viewFor(child, 'user', user), switchTo: child.id });
   }
 
-  // Живая переписка (new/processing) — просто дополняем ленту.
+  // Живой диалог (new/processing/answered) — дополняем ленту.
   rec.messages = rec.messages || [];
   rec.messages.push({ from: 'user', by: rec.userMention, text, time: Date.now() });
+  if (rec.state === 'answered') rec._gateOk = false;
   store.set(rec);
   await refreshCard(rec);
   res.json(viewFor(rec, 'user', user));
+});
+
+app.post('/api/close', async (req, res) => {
+  const user = authUser(req, res); if (!user) return;
+  const rec = store.get(req.body.sid);
+  if (!rec) return res.status(404).json({ error: 'Обращение не найдено' });
+
+  const role = await roleFor(rec, user);
+  if (!role) return res.status(403).json({ error: 'Нет доступа к этому обращению' });
+
+  if (rec.state === 'closed') return res.json({ ...viewFor(rec, role, user), ok: true });
+
+  if (role === 'mod') {
+    const gate = canModClose(rec);
+    if (!gate.ok) return res.status(409).json({ error: gate.reason });
+    await closeSuggestion(rec, 'mod');
+  } else {
+    // Подписчик закрывает своё обращение вручную в любой момент.
+    await closeSuggestion(rec, 'user');
+  }
+  res.json({ ...viewFor(rec, role, user), ok: true });
 });
 
 app.post('/api/reject', async (req, res) => {
@@ -854,8 +963,8 @@ app.listen(PORT, '0.0.0.0', async () => {
     }
   } catch (e) { console.error('getMe:', e.message); }
 
-  const pendingCount = store.all().filter(r => r.state !== 'answered').length;
-  if (pendingCount) console.log(`ℹ️ В очереди при старте: ${pendingCount} обращений`);
+  const pendingCount = store.all().filter(r => r.state !== 'closed').length;
+  if (pendingCount) console.log(`ℹ️ Активных при старте: ${pendingCount} обращений`);
 
   if (PUBLIC_URL) {
     try {
@@ -871,6 +980,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   setInterval(() => {
     updateQueue().catch(e => console.error('updateQueue:', e.message));
     releaseStale().catch(e => console.error('releaseStale:', e.message));
+    refreshDialogCards().catch(e => console.error('refreshDialogCards:', e.message));
     purgeExpiredMutes();
   }, 60000);
 });

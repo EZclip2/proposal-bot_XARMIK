@@ -18,7 +18,6 @@
     --danger:   #e15b56;
     --ok:       #4bb34b;
     --warn:     #e0a13a;
-    --radius:   19px;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;margin:0;padding:0}
   html,body{height:100%}
@@ -31,14 +30,13 @@
 
   /* ---------- Header ---------- */
   header{
-    flex:0 0 auto;padding:calc(env(safe-area-inset-top) + 10px) 14px 10px;
+    flex:0 0 auto;padding:calc(env(safe-area-inset-top) + 10px) 12px 10px;
     background:var(--panel);display:flex;align-items:center;gap:11px;
     box-shadow:0 1px 8px rgba(0,0,0,.28);z-index:5;
   }
   .h-ava{
     flex:0 0 auto;width:42px;height:42px;border-radius:50%;display:grid;place-items:center;
-    font-weight:600;font-size:16px;color:#fff;
-    background:linear-gradient(135deg,#5a9be6,#3f7bc4);
+    font-weight:600;font-size:16px;color:#fff;background:linear-gradient(135deg,#5a9be6,#3f7bc4);
   }
   .h-ava.mod{background:linear-gradient(135deg,#e0a13a,#d1852a)}
   .h-info{flex:1;min-width:0}
@@ -48,16 +46,19 @@
   .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
   .dot.new{background:var(--warn)}
   .dot.processing{background:var(--accent);animation:pulse 1.4s infinite}
-  .dot.answered{background:var(--ok)}
+  .dot.answered{background:var(--link)}
+  .dot.closed{background:var(--ok)}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(77,143,214,.6)}70%{box-shadow:0 0 0 7px rgba(77,143,214,0)}100%{box-shadow:0 0 0 0 rgba(77,143,214,0)}}
-  .h-act{flex:0 0 auto;display:flex;gap:8px}
+  .h-act{flex:0 0 auto;display:flex;gap:7px}
   .icon-btn{
     width:38px;height:38px;border-radius:50%;border:none;cursor:pointer;
     background:rgba(255,255,255,.07);color:var(--text);font-size:17px;display:grid;place-items:center;
-    transition:background .15s,transform .1s;
+    transition:background .15s,transform .1s,opacity .15s;
   }
   .icon-btn:active{transform:scale(.9)}
+  .icon-btn.ok{color:var(--ok)}
   .icon-btn.danger{color:var(--danger)}
+  .icon-btn.dim{opacity:.4}
 
   /* ---------- Feed ---------- */
   #feed{
@@ -78,13 +79,9 @@
   .row.modmsg .ava{background:linear-gradient(135deg,#e0a13a,#d1852a)}
   .bubble{
     position:relative;max-width:calc(100% - 52px);padding:8px 12px 6px;border-radius:16px;
-    word-break:break-word;overflow-wrap:anywhere;white-space:pre-wrap;
-    box-shadow:0 1px 1px rgba(0,0,0,.15);
+    word-break:break-word;overflow-wrap:anywhere;white-space:pre-wrap;box-shadow:0 1px 1px rgba(0,0,0,.15);
   }
-  .me .bubble{
-    background:linear-gradient(135deg,var(--accent),#3f7bc4);color:var(--accent-t);
-    border-bottom-right-radius:5px;
-  }
+  .me .bubble{background:linear-gradient(135deg,var(--accent),#3f7bc4);color:var(--accent-t);border-bottom-right-radius:5px}
   .them .bubble{background:var(--their);border-bottom-left-radius:5px}
   .bubble .who{font-size:12px;font-weight:600;color:var(--link);margin-bottom:2px}
   .me .bubble .who{color:rgba(255,255,255,.85)}
@@ -98,9 +95,8 @@
   .sys.ctx-div{display:flex;align-items:center;gap:10px;width:90%;color:var(--hint)}
   .sys.ctx-div::before,.sys.ctx-div::after{content:"";flex:1;height:1px;background:rgba(255,255,255,.12)}
 
-  /* Пустое состояние / загрузка / ошибка */
   .center-wrap{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--hint);padding:30px;text-align:center}
-  .center-wrap .emo{font-size:52px;filter:grayscale(.1)}
+  .center-wrap .emo{font-size:52px}
   .center-wrap b{color:var(--text);font-size:16px}
   .skel{width:100%;max-width:520px;display:flex;flex-direction:column;gap:14px;padding:20px}
   .skel .sk{height:34px;border-radius:14px;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.11),rgba(255,255,255,.05));background-size:200% 100%;animation:shimmer 1.3s infinite}
@@ -108,14 +104,14 @@
   .skel .sk.l{align-self:flex-start;width:72%}
   @keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 
-  /* Баннер (locked / read-only) */
-  .banner{flex:0 0 auto;padding:9px 14px;text-align:center;font-size:13px;background:rgba(224,161,58,.15);color:var(--warn);border-top:1px solid rgba(224,161,58,.25)}
+  .banner{flex:0 0 auto;padding:9px 14px;text-align:center;font-size:13px;border-top:1px solid rgba(255,255,255,.08)}
+  .banner.warn{background:rgba(224,161,58,.15);color:var(--warn)}
+  .banner.ok{background:rgba(75,179,75,.15);color:var(--ok)}
+  .banner.info{background:rgba(98,160,224,.13);color:var(--link)}
 
-  /* ---------- Composer ---------- */
   footer{
     flex:0 0 auto;padding:8px 10px calc(env(safe-area-inset-bottom) + 8px);
-    background:var(--panel);display:flex;gap:9px;align-items:flex-end;
-    box-shadow:0 -1px 8px rgba(0,0,0,.25);
+    background:var(--panel);display:flex;gap:9px;align-items:flex-end;box-shadow:0 -1px 8px rgba(0,0,0,.25);
   }
   .input-wrap{flex:1;background:var(--bg);border-radius:22px;display:flex;align-items:flex-end;padding:2px 4px}
   textarea{
@@ -131,11 +127,9 @@
   .send-btn:disabled{opacity:.4;cursor:default}
   .send-btn:not(:disabled):active{transform:scale(.88)}
   .toast{
-    position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 82px);
-    transform:translateX(-50%) translateY(12px);
+    position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 82px);transform:translateX(-50%) translateY(12px);
     background:rgba(0,0,0,.84);color:#fff;padding:9px 16px;border-radius:20px;font-size:13px;
-    opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:30;max-width:88%;text-align:center;
-    box-shadow:0 4px 18px rgba(0,0,0,.4);
+    opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:30;max-width:88%;text-align:center;box-shadow:0 4px 18px rgba(0,0,0,.4);
   }
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .hidden{display:none!important}
@@ -152,6 +146,7 @@
       </div>
     </div>
     <div class="h-act">
+      <button class="icon-btn ok hidden" id="btnClose" title="Завершить">✅</button>
       <button class="icon-btn danger hidden" id="btnReject" title="Отклонить">🚫</button>
     </div>
   </header>
@@ -208,8 +203,8 @@ function fmtTime(ms){
 }
 function fmtDay(ms){
   const d = new Date(ms||Date.now()), now = new Date();
-  const sameDay = (a,b)=>a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();
-  const y = new Date(now); y.setDate(now.getDate()-1);
+  const sameDay=(a,b)=>a.getFullYear()===b.getFullYear()&&a.getMonth()===b.getMonth()&&a.getDate()===b.getDate();
+  const y=new Date(now); y.setDate(now.getDate()-1);
   if (sameDay(d,now)) return 'Сегодня';
   if (sameDay(d,y))   return 'Вчера';
   return d.toLocaleDateString('ru-RU',{day:'numeric',month:'long'});
@@ -218,6 +213,7 @@ function stateMeta(st){
   if (st==='new')        return {label:'новое', cls:'new'};
   if (st==='processing') return {label:'в работе', cls:'processing'};
   if (st==='answered')   return {label:'отвечено', cls:'answered'};
+  if (st==='closed')     return {label:'обработано', cls:'closed'};
   return {label:st||'', cls:''};
 }
 
@@ -242,6 +238,12 @@ function toast(msg){
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2800);
 }
 
+function setBanner(kind, text){
+  const b=$('banner');
+  if(!kind){ b.classList.add('hidden'); return; }
+  b.className='banner '+kind; b.textContent=text;
+}
+
 function render(view){
   lastView = view;
   role = view.role;
@@ -256,26 +258,33 @@ function render(view){
   $('hState').textContent = meta.label;
   $('hDot').className = 'dot ' + meta.cls;
   $('hMeta').textContent = '· 🆔 ' + view.id + (view.parentId ? ' · 🔁 '+view.parentId : '');
-  $('btnReject').classList.toggle('hidden', !(isMod && !view.locked));
 
-  // composer / banner
-  const canWrite = role==='user' || (isMod && !view.locked);
-  $('composer').classList.remove('hidden');
+  // действия в шапке
+  const showClose  = view.closable && !view.locked;
+  const showReject = isMod && !view.locked && !view.closed;
+  $('btnClose').classList.toggle('hidden', !showClose);
+  $('btnClose').classList.toggle('dim', !view.closeEnabled);
+  $('btnClose').title = isMod ? 'Обработать' : 'Завершить';
+  $('btnReject').classList.toggle('hidden', !showReject);
+
+  // право писать: подписчик — всегда (в closed создаст новое); модератор — если не занято и не закрыто
+  const canWrite = (role==='user') || (isMod && !view.locked && !view.closed);
+  $('composer').classList.toggle('hidden', !canWrite);
   input.disabled = !canWrite;
   input.placeholder = isMod
-    ? (view.state==='answered' ? 'Дополнить ответ…' : 'Ваш ответ…')
-    : (view.state==='answered' ? 'Дополнить обращение…' : 'Сообщение…');
+    ? 'Ваш ответ…'
+    : (view.closed ? 'Новое сообщение создаст новое обращение…'
+       : (view.state==='answered' ? 'Дополнить обращение…' : 'Сообщение…'));
   syncSendBtn();
 
-  if (view.locked){
-    $('banner').classList.remove('hidden');
-    $('banner').textContent = '🔒 Обращение уже обрабатывает другой модератор';
-    $('composer').classList.add('hidden');
-  } else {
-    $('banner').classList.add('hidden');
-  }
+  // баннеры
+  if (view.locked)                setBanner('warn','🔒 Обращение уже обрабатывает другой модератор');
+  else if (view.closed && isMod)  setBanner('ok','✅ Обращение обработано');
+  else if (view.closed && !isMod) setBanner('info','✅ Обработано. Новое сообщение создаст новое обращение с этим контекстом.');
+  else if (isMod && view.closable && !view.closeEnabled) setBanner('info','⏳ '+(view.closeHint||'Пока нельзя обработать'));
+  else                            setBanner(null);
 
-  // feed — перерисовываем только при изменениях
+  // лента — перерисовываем только при изменениях
   const key = view.id+'|'+view.state+'|'+view.messages.length+'|'+(view.messages.slice(-1)[0]?.time||0)+'|'+view.locked;
   if (key === renderedKey) return;
   const stick = atBottom() || renderedKey==='';
@@ -290,53 +299,45 @@ function render(view){
     return;
   }
 
-  let lastDay = '', ctxShown = false;
+  let lastDay='', ctxShown=false;
   msgs.forEach(m=>{
-    // разделитель контекста
     if (m.ctx && !ctxShown){
-      ctxShown = true;
+      ctxShown=true;
       const s=document.createElement('div'); s.className='sys ctx-div';
       s.textContent='контекст прошлого обращения'; feed.appendChild(s);
     }
-    // разделитель дат
-    const day = fmtDay(m.time);
-    if (day !== lastDay){
-      lastDay = day;
-      const ds=document.createElement('div'); ds.className='date-sep'; ds.textContent=day; feed.appendChild(ds);
-    }
+    const day=fmtDay(m.time);
+    if (day!==lastDay){ lastDay=day; const ds=document.createElement('div'); ds.className='date-sep'; ds.textContent=day; feed.appendChild(ds); }
 
-    const mine = (isMod && m.from==='mod') || (role==='user' && m.from==='user');
+    const mine=(isMod&&m.from==='mod')||(role==='user'&&m.from==='user');
     const row=document.createElement('div');
     row.className='row '+(mine?'me':'them')+(m.from==='mod'?' modmsg':'')+(m.ctx?' ctx':'');
 
-    const ava=document.createElement('div');
-    ava.className='ava';
+    const ava=document.createElement('div'); ava.className='ava';
     ava.textContent = m.from==='mod' ? '🛡' : initials(m.by||view.userMention);
     row.appendChild(ava);
 
     const b=document.createElement('div'); b.className='bubble';
-    const showWho = !mine; // подпись у чужих
-    // Ответ всегда обезличен — «Администрация» (даже для исторических записей).
+    const showWho=!mine;
     const who = m.from==='mod' ? 'Администрация' : (isMod ? (m.by||'Подписчик') : 'Вы');
-    b.innerHTML =
-      (showWho ? '<div class="who">'+esc(who)+'</div>' : '') +
-      esc(m.text) +
-      '<span class="time">'+fmtTime(m.time)+'</span>';
+    b.innerHTML=(showWho?'<div class="who">'+esc(who)+'</div>':'')+esc(m.text)+'<span class="time">'+fmtTime(m.time)+'</span>';
     row.appendChild(b);
     feed.appendChild(row);
   });
 
+  if (view.closed){
+    const s=document.createElement('div'); s.className='sys';
+    s.textContent='✅ Обращение обработано'; feed.appendChild(s);
+  }
+
   if (stick) feed.scrollTop = feed.scrollHeight;
 }
 
-function syncSendBtn(){
-  sendBtn.disabled = sending || input.disabled || !input.value.trim();
-}
+function syncSendBtn(){ sendBtn.disabled = sending || input.disabled || !input.value.trim(); }
 
 async function refresh(){
   if (!sid) return;
-  try { render(await api('/api/open', { sid })); }
-  catch(e){ /* тихо: разовые ошибки поллинга не рвут сессию */ }
+  try { render(await api('/api/open', { sid })); } catch(e){}
 }
 
 async function boot(){
@@ -359,39 +360,55 @@ async function doSend(){
       sid = view.switchTo;
       toast('Отправлено как новое обращение — с контекстом переписки');
     }
-    renderedKey='';
-    render(view);
+    renderedKey=''; render(view);
     feed.scrollTop = feed.scrollHeight;
     if (tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
   } catch(e){
     if (tg && tg.showAlert) tg.showAlert(e.message); else alert(e.message);
   } finally {
-    sending = false; syncSendBtn(); input.focus();
+    sending=false; syncSendBtn(); input.focus();
   }
 }
 
-function autoGrow(){
-  input.style.height='42px';
-  input.style.height=Math.min(input.scrollHeight,130)+'px';
-}
+function autoGrow(){ input.style.height='42px'; input.style.height=Math.min(input.scrollHeight,130)+'px'; }
 
 sendBtn.addEventListener('click', doSend);
 input.addEventListener('input', ()=>{ autoGrow(); syncSendBtn(); });
-input.addEventListener('keydown', (e)=>{
-  if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); doSend(); }
+input.addEventListener('keydown', (e)=>{ if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); doSend(); } });
+
+$('btnClose').addEventListener('click', ()=>{
+  const v = lastView; if (!v) return;
+  if (!v.closeEnabled){
+    const hint = v.closeHint || 'Пока нельзя обработать.';
+    if (tg && tg.showAlert) tg.showAlert(hint); else alert(hint);
+    return;
+  }
+  const q = (role==='mod') ? 'Обработать обращение? Оно уйдёт в «Обработанные».'
+                           : 'Завершить обращение? Диалог будет закрыт.';
+  const ask=(cb)=> (tg&&tg.showConfirm)?tg.showConfirm(q,cb):cb(confirm(q));
+  ask(async (ok)=>{
+    if(!ok) return;
+    try{
+      const view = await api('/api/close', { sid });
+      renderedKey=''; render(view);
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+      toast(role==='mod' ? 'Обработано ✅' : 'Обращение завершено ✅');
+    }catch(e){ if(tg&&tg.showAlert)tg.showAlert(e.message); else alert(e.message); }
+  });
 });
 
-$('btnReject').addEventListener('click', async ()=>{
-  const ask = (cb)=> (tg && tg.showConfirm) ? tg.showConfirm('Отклонить обращение? Действие необратимо.', cb) : cb(confirm('Отклонить обращение?'));
+$('btnReject').addEventListener('click', ()=>{
+  const q='Отклонить обращение? Действие необратимо.';
+  const ask=(cb)=> (tg&&tg.showConfirm)?tg.showConfirm(q,cb):cb(confirm(q));
   ask(async (ok)=>{
-    if (!ok) return;
-    try {
+    if(!ok) return;
+    try{
       await api('/api/reject', { sid });
       clearInterval(pollTimer);
       if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('warning');
       if (tg && tg.close) tg.close();
       else { screen('error',{msg:'Обращение отклонено.'}); feed.innerHTML='<div class="center-wrap"><div class="emo">🚫</div><b>Отклонено</b></div>'; }
-    } catch(e){ if (tg&&tg.showAlert) tg.showAlert(e.message); else alert(e.message); }
+    }catch(e){ if(tg&&tg.showAlert)tg.showAlert(e.message); else alert(e.message); }
   });
 });
 
