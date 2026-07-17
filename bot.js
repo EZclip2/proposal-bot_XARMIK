@@ -52,6 +52,28 @@ function recordAndCheckSpam(userId, text) {
   return null;
 }
 
+// ======================= ЛОКАЛЬНЫЙ ФИЛЬТР ОЧЕВИДНОГО МУСОРА (без ИИ) =======================
+// Ловит самые частые случаи "trash" из промпта ИИ-классификатора локально —
+// это самая большая экономия токенов, т.к. такие сообщения вообще не идут в батч.
+// Специально консервативен: если есть малейшее сомнение — пропускает дальше, к ИИ.
+const TRASH_WORDS = new Set([
+  'привет', 'здравствуйте', 'драсте', 'ку', 'хай', 'hi', 'hello', 'hey',
+  'тест', 'test', 'проверка',
+  'ок', 'окей', 'ok', 'okay', 'ага', 'угу', 'да', 'нет',
+  'лол', 'lol', 'кек', 'ахах', 'ахаха', 'хах', 'ха',
+  'спасибо', 'спс', 'пожалуйста', 'пж',
+]);
+
+function isObviousTrash(text) {
+  const t = text.trim().toLowerCase().replace(/[.,!?…]+$/g, '');
+  if (!t) return false;
+  // 1-2 символа без учёта пунктуации — не может быть осмысленным обращением
+  if (t.replace(/[^a-zа-яё0-9]/gi, '').length <= 2) return true;
+  // одно слово из списка филлеров
+  if (!/\s/.test(t) && TRASH_WORDS.has(t)) return true;
+  return false;
+}
+
 // ======================= ИИ-КЛАССИФИКАЦИЯ (батчинг + дебаунс) =======================
 // Провайдер задаётся env — сменить без правки кода:
 //   OpenRouter: AI_BASE_URL=https://openrouter.ai/api/v1  AI_MODEL=meta-llama/llama-3.3-70b-instruct:free
@@ -69,20 +91,17 @@ const AI_SYSTEM =
   '  NOT trash: rude-but-real feedback ("всё говно", "ужасный сервис"), vague negatives ("всё плохо"), short real questions ("цена?", "когда?", "где?").\n' +
   '- "biz": business proposals, ads, partnerships, commercial offers.\n' +
   '- "reg": everything else — questions, feedback, bugs, suggestions, complaints, even if vague or emotional.\n' +
-  'For trash only — set "mute": true if the message shows DELIBERATE malice: targeted insults, hate, threats, intentional spam flooding, or repeated nonsense after a warning.\n' +
-  'Set "mute": false if the message is just unclear, meaningless, or unintentional (user likely confused or testing).\n' +
-  'When trash+mute=false: fill "reply" with a polite Russian request to rephrase.\n' +
-  'When trash+mute=true or cat!=trash: leave "reply" empty.\n' +
+  'For trash only — set "mute": true if the message shows DELIBERATE malice: targeted insults, hate, threats, intentional spam flooding, or repeated nonsense after a warning. Otherwise false.\n' +
   'When unsure between trash and reg → choose reg.\n' +
   'Input: [{"id":1,"text":"..."}]\n' +
-  'Output only valid JSON, no markdown:\n' +
-  '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","mute":false,"reply":"..."}]}';
+  'Output ONLY compact JSON, no markdown, no <think>, no explanations, no text outside JSON:\n' +
+  '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","mute":false}]}';
 
 // Параметры дебаунс-буфера
 const DEBOUNCE_FIRST = 15000;
 const DEBOUNCE_EXT   =  5000;
 const DEBOUNCE_MAX   = 45000;
-const BATCH_MAX      =    15;
+const BATCH_MAX      =    25;
 
 let batchItems    = [];
 let batchStart    = null;
@@ -100,6 +119,9 @@ async function deletePendingAck(userId) {
   try { await bot.deleteMessage(entry.chatId, entry.msgId); } catch {}
 }
 
+const TRASH_REPLY_TEXT =
+  '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
+
 async function flushBatch() {
   clearTimeout(batchTimer);
   batchTimer = null; batchStart = null; batchDeadline = null; batchSeq = 0;
@@ -109,12 +131,13 @@ async function flushBatch() {
 
   const aiItems = items
     .filter(it => (it.msg.text || it.msg.caption || '').trim())
-    .map(it => ({ id: it.id, text: (it.msg.text || it.msg.caption || '').slice(0, 1000) }));
+    // 400 символов достаточно, чтобы понять категорию — экономим входные токены
+    .map(it => ({ id: it.id, text: (it.msg.text || it.msg.caption || '').slice(0, 400) }));
 
   const classMap = await classifyBatch(aiItems);
 
   for (const { id, msg } of items) {
-    const { cat, mute, reply } = classMap.get(id) || { cat: 'reg', mute: false, reply: '' };
+    const { cat, mute } = classMap.get(id) || { cat: 'reg', mute: false };
 
     await deletePendingAck(msg.from.id);
 
@@ -126,11 +149,9 @@ async function flushBatch() {
           '🚫 <b>Сообщение нарушает правила.</b>\n\nОтправка заблокирована на <b>15 минут</b>.',
           { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       } else {
-        // Непонятное сообщение — просим переформулировать
-        const text = (reply && reply.trim())
-          ? reply
-          : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
-        await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+        // Непонятное сообщение — просим переформулировать (единый шаблон вместо
+        // персонального текста от ИИ — экономит выходные токены на каждом сообщении)
+        await bot.sendMessage(msg.from.id, TRASH_REPLY_TEXT, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       }
     } else {
       const kind = cat === 'biz' ? 'biz' : 'normal';
@@ -151,7 +172,11 @@ function scheduleBatch() {
 // вырезает первый {...}-блок из окружающего текста.
 function parseAiJson(content) {
   if (!content || !content.trim()) throw new Error('no json in LLM response (пустой content)');
-  const cleaned = content.trim()
+  const cleaned = content
+    // reasoning-модели (DeepSeek-R1 и т.п.) иногда пишут рассуждения прямо в content
+    // вместо отдельного поля reasoning — вырезаем такой блок целиком.
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .trim()
     .replace(/^```(?:json)?\s*/i, '')
     .replace(/```\s*$/i, '')
     .trim();
@@ -164,7 +189,7 @@ function parseAiJson(content) {
 }
 
 async function classifyBatch(items) {
-  const fallback = () => new Map(items.map(i => [i.id, { cat: 'reg', mute: false, reply: '' }]));
+  const fallback = () => new Map(items.map(i => [i.id, { cat: 'reg', mute: false }]));
   if (!AI_API_KEY || !items.length) return fallback();
 
   const VALID = new Set(['trash', 'biz', 'reg']);
@@ -177,11 +202,15 @@ async function classifyBatch(items) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
         body: JSON.stringify({
-          model: AI_MODEL, temperature: 0, max_tokens: 100 * items.length + 50,
-          // Просим провайдера гарантировать JSON-ответ. Провайдеры/модели, которые
-          // не умеют — просто проигнорируют это поле, а не упадут (проверено на
-          // OpenRouter/Groq/DeepSeek); дальше всё равно есть защитный парсер.
+          model: AI_MODEL, temperature: 0,
+          // Ответ теперь компактный ({id,cat,mute} без текста reply) — 50 токенов на
+          // сообщение с запасом хватает. Минимум 300 — страховка на случай, если
+          // AI_MODEL всё же reasoning-модель и потратит часть лимита на "размышления".
+          max_tokens: Math.max(300, 50 * items.length + 30),
           response_format: { type: 'json_object' },
+          // OpenRouter: явно просим не тратить токены на reasoning-трейс
+          // (для провайдеров, которые это поле не знают, — просто игнорируется).
+          ...(AI_BASE_URL.includes('openrouter.ai') ? { reasoning: { enabled: false } } : {}),
           messages: [
             { role: 'system', content: AI_SYSTEM },
             { role: 'user', content: JSON.stringify(items) },
@@ -200,8 +229,7 @@ async function classifyBatch(items) {
           const cat = VALID.has(r.cat) ? r.cat : 'reg';
           result.set(r.id, {
             cat,
-            mute:  cat === 'trash' && r.mute === true,
-            reply: String(r.reply || ''),
+            mute: cat === 'trash' && r.mute === true,
           });
         }
       }
@@ -569,6 +597,13 @@ bot.on('message', async (msg) => {
   // 4. Медиа без текста → сразу как обычное, без LLM
   if (!textForAI) {
     await createSuggestion(msg, 'normal').catch(e => console.error('createSuggestion:', e.message));
+    return;
+  }
+
+  // 4.5 Явный мусор (однословные "привет"/"тест"/"ок" и т.п.) — отсекаем локально,
+  // не тратя вызов ИИ. Мгновенный ответ, без mute — пользователь мог просто ошибиться.
+  if (isObviousTrash(textForAI)) {
+    await bot.sendMessage(msg.from.id, TRASH_REPLY_TEXT, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
     return;
   }
 
