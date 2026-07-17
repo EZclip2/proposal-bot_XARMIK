@@ -29,7 +29,7 @@ const userLastText = new Map(); // userId → { text, time }    (для дубл
 
 const SPAM_FLOOD_WINDOW = 30  * 1000; // окно флуда, мс
 const SPAM_FLOOD_LIMIT  = 5;          // >5 сообщений в окне = флуд
-const SPAM_DUP_WINDOW   = 2  * 60 * 1000; // повтор той же фразы в течение 2 мин
+const SPAM_DUP_WINDOW   = 10  * 1000; // повтор той же фразы в течение 2 мин
 
 // Возвращает 'flood' | 'duplicate' | null
 function recordAndCheckSpam(userId, text) {
