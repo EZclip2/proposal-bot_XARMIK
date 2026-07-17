@@ -67,7 +67,7 @@ const AI_SYSTEM =
   'When trash+mute=true or cat!=trash: leave "reply" empty.\n' +
   'When unsure between trash and reg → choose reg.\n' +
   'Input: [{"id":1,"text":"..."}]\n' +
-  'Output only valid JSON, no markdown:\n' +
+  'Output ONLY a raw JSON object, no markdown, no code fences, no commentary, no reasoning:\n' +
   '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","mute":false,"reply":"..."}]}';
 
 const DEBOUNCE_FIRST = 15000;
@@ -135,6 +135,27 @@ function scheduleBatch() {
   batchTimer = setTimeout(flushBatch, Math.max(0, batchDeadline - Date.now()));
 }
 
+// Достаём JSON-объект из ответа модели: снимаем reasoning-теги, markdown-фенсы,
+// пробуем прямой парс и первый сбалансированный { ... }.
+function extractJsonObject(content) {
+  if (!content) return null;
+  if (Array.isArray(content)) content = content.map(p => (p && (p.text || p.content)) || '').join('');
+  let s = String(content).trim();
+  s = s.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  try { return JSON.parse(s); } catch {}
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) { try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; } } }
+  }
+  return null;
+}
+
 async function classifyBatch(items) {
   const result = new Map(items.map(i => [i.id, { cat: 'reg', mute: false, reply: '' }]));
   if (!AI_API_KEY || !items.length) return result;
@@ -145,7 +166,10 @@ async function classifyBatch(items) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
       body: JSON.stringify({
-        model: AI_MODEL, temperature: 0, max_tokens: 100 * items.length + 50,
+        model: AI_MODEL,
+        temperature: 0,
+        max_tokens: Math.min(2000, 120 * items.length + 200),
+        response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: AI_SYSTEM },
           { role: 'user', content: JSON.stringify(items) },
@@ -155,10 +179,13 @@ async function classifyBatch(items) {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
     const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content || '';
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON in LLM response');
-    const parsed = JSON.parse(jsonMatch[0]);
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content ?? choice?.message?.reasoning ?? '';
+    const parsed = extractJsonObject(content);
+    if (!parsed) {
+      const snippet = String(content || '').replace(/\s+/g, ' ').slice(0, 200);
+      throw new Error(`no JSON (finish=${choice?.finish_reason}, len=${String(content || '').length}, snippet="${snippet}")`);
+    }
     const VALID = new Set(['trash', 'biz', 'reg']);
     for (const r of (parsed.results || [])) {
       if (result.has(r.id)) {
@@ -279,9 +306,7 @@ const GREETING =
   'я сам определю категорию и передам администрации. Дальше общение идёт в приложении-переписке.';
 
 const HOME_KB  = { inline_keyboard: [[{ text: '🔙 В начало', callback_data: 'home' }]] };
-// Кнопка открытия переписки в мини-приложении
 const openAppKb = (sid, label) => ({ inline_keyboard: [[{ text: label || '💬 Открыть переписку', url: webAppUrl(sid) }]] });
-// Для активного обращения подписчика: открыть переписку + отменить
 const userKb = (sid) => ({ inline_keyboard: [
   [{ text: '💬 Открыть переписку', url: webAppUrl(sid) }],
   [{ text: '❌ Отменить обращение', callback_data: `cancel:${sid}` }],
@@ -303,7 +328,7 @@ function cardKeyboard(sid, state) {
   ] };
 }
 
-// Карточка НЕ содержит текст обращения — только мета и счётчик сообщений.
+// Карточка НЕ содержит текст обращения — только мета, статус и счётчик сообщений.
 function cardText(rec) {
   const isBiz = rec.kind === 'biz';
   const noun = isBiz ? 'деловое предложение' : 'обращение';
@@ -312,8 +337,11 @@ function cardText(rec) {
   const head =
     `👤 ${esc(rec.userMention)}  ·  🆔 <code>${rec.id}</code>\n` +
     `<code>[user: ${rec.userId}]</code>${ctx}`;
-  const count = (rec.messages || []).length;
-  const foot = `\n\n💬 Сообщений в переписке: <b>${count}</b>\n<i>Текст — внутри приложения. Откройте, чтобы прочитать и ответить.</i>`;
+  const real = (rec.messages || []).filter(m => !m.ctx);
+  const fromUser = real.filter(m => m.from === 'user').length;
+  const fromMod  = real.filter(m => m.from === 'mod').length;
+  const foot = `\n\n💬 Сообщений: <b>${real.length}</b> (👤 ${fromUser} · 🛡 ${fromMod})\n` +
+               `<i>Текст — внутри приложения. Ответить можно кнопкой ниже или реплаем на это сообщение.</i>`;
 
   if (rec.state === 'new')        return `${isBiz ? '💎' : '🟡'} <b>Новое ${noun}</b>\n${head}${foot}`;
   if (rec.state === 'processing') return `${gem}🟠 <b>В работе</b> · ${esc(rec.moderatorName)}\n${head}${foot}`;
@@ -328,7 +356,9 @@ async function refreshCard(rec) {
   try {
     if (rec.isMedia) await bot.editMessageCaption(clampCaption(cardText(rec)), opts);
     else             await bot.editMessageText(cardText(rec), opts);
-  } catch (e) { console.error('refreshCard:', e.message); }
+  } catch (e) {
+    if (!String(e.message).includes('message is not modified')) console.error('refreshCard:', e.message);
+  }
 }
 
 async function relocateAnswered(rec) {
@@ -420,7 +450,6 @@ async function createSuggestion(msg, kind) {
     if (isText) {
       sent = await bot.sendMessage(MOD_CHAT_ID, cardText(rec), { parse_mode: 'HTML', reply_markup: kb, ...thread });
     } else {
-      // Медиа пересылаем (модераторам нужно его видеть), но подпись — только мета.
       sent = await bot.copyMessage(MOD_CHAT_ID, msg.chat.id, msg.message_id,
         { caption: clampCaption(cardText(rec)), parse_mode: 'HTML', reply_markup: kb, ...thread });
     }
@@ -478,12 +507,36 @@ async function createFollowupTicket(parent, text) {
   } catch (e) { console.error('createFollowupTicket:', e.message); return null; }
 }
 
+// Общая логика ответа модератора — из мини-аппа И из реплая в группе.
+async function applyModAnswer(rec, modUser, text) {
+  const isFirst = rec.state !== 'answered';
+  rec.messages = rec.messages || [];
+  rec.messages.push({ from: 'mod', by: modName(modUser), text, time: Date.now() });
+  rec.moderatorId = modUser.id;
+  rec.moderatorName = modName(modUser);
+  if (isFirst) rec.state = 'answered';
+  store.set(rec);
+
+  // Подписчику — уведомление без текста.
+  try {
+    await bot.sendMessage(rec.userId,
+      `💬 <b>Вам ответили</b>\n🆔 <code>${rec.id}</code>\n\nОткройте переписку, чтобы прочитать и продолжить.`,
+      { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) });
+  } catch (e) { console.error('deliver:', e.message); }
+
+  if (isFirst && rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateAnswered(rec);
+  else await refreshCard(rec);
+
+  updateQueue().catch(() => {});
+}
+
 async function rejectSuggestion(sid) {
   const rec = store.get(sid);
   if (!rec) return false;
   try { await bot.deleteMessage(MOD_CHAT_ID, rec.modMessageId); } catch (e) { console.error('reject del:', e.message); }
 
-  const wasAnswered = rec.state === 'answered' || (rec.messages || []).some(m => m.from === 'mod');
+  // «Отвечено» = есть реальный (не контекстный) ответ модератора.
+  const wasAnswered = (rec.messages || []).some(m => m.from === 'mod' && !m.ctx);
   if (!wasAnswered) {
     muteUser(rec.userId);
     try {
@@ -522,6 +575,22 @@ async function cancelSuggestion(sid, q) {
   await bot.answerCallbackQuery(q.id, { text: 'Обращение отменено' });
 }
 
+// Ответ модератора реплаем на карточку в группе.
+async function handleModGroupReply(msg) {
+  const replyTo = msg.reply_to_message;
+  if (!replyTo || msg.from.is_bot) return;
+  const body = (msg.text || msg.caption || '').trim();
+  if (!body || body.startsWith('/')) return;
+
+  const rec = store.all().find(r => r.modMessageId === replyTo.message_id);
+  if (!rec) return;                      // реплай не на карточку — игнор
+  if (!(await isModerator(msg.from.id))) return;
+
+  await applyModAnswer(rec, msg.from, body).catch(e => console.error('groupReply:', e.message));
+  // Убираем текст из группы — он теперь в приложении.
+  try { await bot.deleteMessage(MOD_CHAT_ID, msg.message_id); } catch {}
+}
+
 // ======================= ХЭНДЛЕРЫ =======================
 bot.onText(/^\/start/, async (msg) => {
   if (msg.chat.type !== 'private') return;
@@ -529,12 +598,18 @@ bot.onText(/^\/start/, async (msg) => {
 });
 
 bot.on('message', async (msg) => {
-  if (String(msg.chat.id) === MOD_CHAT_ID && msg.text && /^\/(id|topic)\b/.test(msg.text)) {
-    await bot.sendMessage(MOD_CHAT_ID,
-      `chat_id: <code>${msg.chat.id}</code>\nmessage_thread_id: <code>${msg.message_thread_id || '(General / нет темы)'}</code>`,
-      { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+  // ---- Группа модерации ----
+  if (String(msg.chat.id) === MOD_CHAT_ID) {
+    if (msg.text && /^\/(id|topic)\b/.test(msg.text)) {
+      await bot.sendMessage(MOD_CHAT_ID,
+        `chat_id: <code>${msg.chat.id}</code>\nmessage_thread_id: <code>${msg.message_thread_id || '(General / нет темы)'}</code>`,
+        { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+      return;
+    }
+    await handleModGroupReply(msg).catch(e => console.error('handleModGroupReply:', e.message));
     return;
   }
+
   if (msg.chat.type !== 'private') return;
   if (msg.text && msg.text.startsWith('/')) return;
 
@@ -637,7 +712,6 @@ function checkInitData(initData) {
   } catch { return null; }
 }
 
-// Проверяем только подпись — роль определяем по обращению.
 function authUser(req, res) {
   const user = checkInitData((req.body && req.body.initData) || '');
   if (!user || !user.id) { res.status(403).json({ error: 'Некорректная подпись' }); return null; }
@@ -645,7 +719,6 @@ function authUser(req, res) {
 }
 const modName = (u) => (u.username ? '@' + u.username : (u.first_name || 'модератор'));
 
-// role: 'user' (владелец обращения) | 'mod' (админ группы) | null
 async function roleFor(rec, user) {
   if (rec && String(rec.userId) === String(user.id)) return 'user';
   if (await isModerator(user.id)) return 'mod';
@@ -665,7 +738,6 @@ function viewFor(rec, role, user) {
     messages: (rec.messages || []).map(m => ({
       from: m.from, by: m.by, text: m.text, time: m.time, ctx: !!m.ctx,
     })),
-    // Модератор заблокирован, если обращение ведёт другой модератор и оно ещё не отвечено.
     locked: role === 'mod' && rec.moderatorId &&
             String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered',
   };
@@ -709,37 +781,31 @@ app.post('/api/send', async (req, res) => {
   if (!text) return res.status(400).json({ error: 'Пустое сообщение' });
   if (text.length > 3500) return res.status(400).json({ error: 'Слишком длинное сообщение' });
 
+  // ---- Модератор ----
   if (role === 'mod') {
-    // Лок: другой модератор уже ведёт неотвеченное обращение.
     if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
       return res.status(409).json({ error: 'Обращение уже обрабатывает другой модератор' });
     }
-    const isFirst = rec.state !== 'answered';
-    rec.messages = rec.messages || [];
-    rec.messages.push({ from: 'mod', by: modName(user), text, time: Date.now() });
-    rec.moderatorId = user.id;
-    rec.moderatorName = modName(user);
-    if (isFirst) rec.state = 'answered';
-    store.set(rec);
-
-    // Уведомление подписчику — без текста ответа.
-    try {
-      await bot.sendMessage(rec.userId,
-        `💬 <b>Вам ответили</b>\n🆔 <code>${rec.id}</code>\n\nОткройте переписку, чтобы прочитать и продолжить.`,
-        { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) });
-    } catch (e) { console.error('deliver:', e.message); }
-
-    if (isFirst && rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateAnswered(rec);
-    else await refreshCard(rec);
-
-    res.json(viewFor(rec, 'mod', user));
-    updateQueue().catch(() => {});
-    return;
+    await applyModAnswer(rec, user, text);
+    return res.json(viewFor(rec, 'mod', user));
   }
 
-  // role === 'user'
-  // Правило: если уже отвечено (лежит в «просмотренных») — уходит как новое с контекстом.
+  // ---- Подписчик ----
+  const muteLeft = mutedFor(user.id);
+  if (muteLeft > 0) {
+    return res.status(403).json({ error: `Отправка заблокирована. Попробуйте через ~${Math.ceil(muteLeft / 60000)} мин.` });
+  }
+
   if (rec.state === 'answered') {
+    // Не плодим дубликаты: если уже есть активное обращение — пишем в него.
+    const active = store.all().find(r => String(r.userId) === String(user.id) && r.state !== 'answered');
+    if (active) {
+      active.messages = active.messages || [];
+      active.messages.push({ from: 'user', by: active.userMention, text, time: Date.now() });
+      store.set(active);
+      await refreshCard(active);
+      return res.json({ ...viewFor(active, 'user', user), switchTo: active.id });
+    }
     const child = await createFollowupTicket(rec, text);
     if (!child) return res.status(500).json({ error: 'Не удалось создать обращение' });
     return res.json({ ...viewFor(child, 'user', user), switchTo: child.id });
