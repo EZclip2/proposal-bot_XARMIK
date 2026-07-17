@@ -29,7 +29,7 @@ const userLastText = new Map(); // userId → { text, time }    (для дубл
 
 const SPAM_FLOOD_WINDOW = 30  * 1000; // окно флуда, мс
 const SPAM_FLOOD_LIMIT  = 5;          // >5 сообщений в окне = флуд
-const SPAM_DUP_WINDOW   = 10  * 1000; // повтор той же фразы в течение 2 мин
+const SPAM_DUP_WINDOW   = 2  * 60 * 1000; // повтор той же фразы в течение 2 мин
 
 // Возвращает 'flood' | 'duplicate' | null
 function recordAndCheckSpam(userId, text) {
@@ -143,10 +143,10 @@ async function flushBatch() {
 
     if (cat === 'trash') {
       if (mute) {
-        // Намеренное нарушение — мут 15 минут
-        muteUser(msg.from.id);
+        // Намеренное нарушение — короткий мут (в отличие от ручных нарушений/спама)
+        muteUser(msg.from.id, AI_MUTE_MS);
         await bot.sendMessage(msg.from.id,
-          '🚫 <b>Сообщение нарушает правила.</b>\n\nОтправка заблокирована на <b>15 минут</b>.',
+          '🚫 <b>Сообщение нарушает правила.</b>\n\nОтправка заблокирована на <b>2 минуты</b>.',
           { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       } else {
         // Непонятное сообщение — просим переформулировать (единый шаблон вместо
@@ -279,8 +279,9 @@ function genTicket(userId) {
   return (Date.now().toString(36) + Math.random().toString(36).slice(2, 4)).toUpperCase();
 }
 
-const MUTE_MS = 15 * 60 * 1000;
-function muteUser(userId) { db.mutes[String(userId)] = Date.now() + MUTE_MS; persist(); }
+const MUTE_MS    = 15 * 60 * 1000;
+const AI_MUTE_MS =  2 * 60 * 1000; // мут за намеренный trash от ИИ-классификатора — короче, чем ручные нарушения
+function muteUser(userId, ms = MUTE_MS) { db.mutes[String(userId)] = Date.now() + ms; persist(); }
 function mutedFor(userId) {
   const left = (db.mutes[String(userId)] || 0) - Date.now();
   return left > 0 ? left : 0;
