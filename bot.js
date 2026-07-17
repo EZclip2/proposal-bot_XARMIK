@@ -32,25 +32,39 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || 'https://openrouter.ai/api/v1').
 const AI_MODEL    = (process.env.AI_MODEL || 'meta-llama/llama-3.3-70b-instruct:free').trim();
 
 const AI_SYSTEM =
-  'Classify a JSON array of messages.\n' +
+  'Classify messages sent to a public feedback/suggestion bot.\n' +
   'Categories:\n' +
-  '- "trash": gibberish, random symbols, spam, insults without substance.\n' +
+  '- "trash": zero actionable substance — cannot be meaningfully responded to.\n' +
+  '  IS trash: keyboard mashing (asdf, 123456, ///), random chars, pure profanity with no real complaint behind it, single filler words (test/hi/ok/lol/привет/?/!), emoji-only, "testing 123".\n' +
+  '  NOT trash: rude-but-real feedback ("всё говно", "ужасный сервис"), vague negatives ("всё плохо"), very short real questions ("цена?", "когда?", "где?").\n' +
   '- "biz": business proposals, ads, partnerships, commercial offers.\n' +
-  '- "reg": normal feedback, questions, suggestions, complaints, bug reports.\n' +
+  '- "reg": everything else — questions, feedback, bugs, suggestions, complaints, even if vague, emotional, or very short.\n' +
+  'When unsure between trash and reg → choose reg.\n' +
+  'Input: [{"id":1,"text":"..."}]\n' +
   'Output only valid JSON, no markdown:\n' +
   '{"results":[{"id":1,"cat":"trash"|"biz"|"reg","reply":"polite Russian rephrase request (ONLY if trash, else empty string)"}]}';
 
 // Параметры дебаунс-буфера
-const DEBOUNCE_FIRST = 15000; // базовый таймер для первого сообщения в пачке
-const DEBOUNCE_EXT   =  5000; // продление на каждое следующее (5s > 3s из ТЗ — мобильный ввод)
-const DEBOUNCE_MAX   = 45000; // жёсткий лимит по времени с первого сообщения
-const BATCH_MAX      =    15; // жёсткий лимит по количеству сообщений
+const DEBOUNCE_FIRST = 15000;
+const DEBOUNCE_EXT   =  5000;
+const DEBOUNCE_MAX   = 45000;
+const BATCH_MAX      =    15;
 
 let batchItems    = [];
 let batchStart    = null;
 let batchDeadline = null;
 let batchTimer    = null;
 let batchSeq      = 0;
+
+// хранит msgId сообщения «⏳ Получено» для удаления перед итоговым ответом
+const pendingAck = new Map(); // userId → { chatId, msgId }
+
+async function deletePendingAck(userId) {
+  const entry = pendingAck.get(String(userId));
+  if (!entry) return;
+  pendingAck.delete(String(userId));
+  try { await bot.deleteMessage(entry.chatId, entry.msgId); } catch {}
+}
 
 async function flushBatch() {
   clearTimeout(batchTimer);
@@ -68,11 +82,13 @@ async function flushBatch() {
   for (const { id, msg } of items) {
     const { cat, reply } = classMap.get(id) || { cat: 'reg', reply: '' };
 
+    await deletePendingAck(msg.from.id);
+
     if (cat === 'trash') {
       const text = (reply && reply.trim())
         ? reply
         : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
-      await replaceMsg(msg.from.id, msg.chat.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+      await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
     } else {
       const kind = cat === 'biz' ? 'biz' : 'normal';
       await createSuggestion(msg, kind).catch(e => console.error('createSuggestion:', e.message));
@@ -156,7 +172,6 @@ function genTicket(userId) {
   return (Date.now().toString(36) + Math.random().toString(36).slice(2, 4)).toUpperCase();
 }
 
-// Мут после отклонения (15 минут).
 const MUTE_MS = 15 * 60 * 1000;
 function muteUser(userId) { db.mutes[String(userId)] = Date.now() + MUTE_MS; persist(); }
 function mutedFor(userId) {
@@ -164,52 +179,28 @@ function mutedFor(userId) {
   return left > 0 ? left : 0;
 }
 
-// ======================= ОДНО АКТИВНОЕ СООБЩЕНИЕ В ЛИЧКЕ =======================
-// Map<userId, { msgId, chatId }> — единственное видимое сообщение бота у подписчика.
-const userActiveMsg = new Map();
-// Map<userId, timestamp> — время последней активности (любой send/edit/interaction).
-const userLastActive = new Map();
-
-function trackMsg(userId, chatId, msgId) {
-  userActiveMsg.set(String(userId), { msgId, chatId });
-  userLastActive.set(String(userId), Date.now());
-}
-
-// Обновляет временную метку без смены сообщения (для editMessageText очереди).
-function touchUser(userId) {
-  userLastActive.set(String(userId), Date.now());
-}
-
-// Отправляет новое сообщение и удаляет предыдущее активное.
-// Если отправка провалилась — старое сообщение остаётся (безопасное поведение).
-async function replaceMsg(userId, chatId, text, opts = {}) {
-  const sent = await bot.sendMessage(chatId, text, opts);
-  const old = userActiveMsg.get(String(userId));
-  if (old) { try { await bot.deleteMessage(old.chatId, old.msgId); } catch {} }
-  trackMsg(userId, chatId, sent.message_id);
-  return sent;
-}
-
-// Удаляет активное сообщение и очищает запись. Используется при reject уже-отвеченного.
-async function clearUserMsg(userId) {
-  const entry = userActiveMsg.get(String(userId));
-  if (!entry) return;
-  userActiveMsg.delete(String(userId));
-  userLastActive.delete(String(userId));
-  try { await bot.deleteMessage(entry.chatId, entry.msgId); } catch {}
-}
-
-// Периодическая чистка: удаляет сообщения пользователей, неактивных > 15 мин.
-const STALE_TTL = 15 * 60 * 1000;
-async function cleanStaleUserMsgs() {
+function purgeExpiredMutes() {
   const now = Date.now();
-  for (const [uid, entry] of userActiveMsg.entries()) {
-    if (now - (userLastActive.get(uid) || 0) > STALE_TTL) {
-      userActiveMsg.delete(uid);
-      userLastActive.delete(uid);
-      try { await bot.deleteMessage(entry.chatId, entry.msgId); } catch {}
-    }
+  let changed = false;
+  for (const [uid, exp] of Object.entries(db.mutes)) {
+    if (exp < now) { delete db.mutes[uid]; changed = true; }
   }
+  if (changed) persist();
+}
+
+// ======================= КЕШ МОДЕРАТОРОВ =======================
+const modCache = new Map(); // userId → { result, expiry }
+const MOD_CACHE_TTL = 5 * 60 * 1000;
+
+async function isModerator(userId) {
+  const cached = modCache.get(String(userId));
+  if (cached && Date.now() < cached.expiry) return cached.result;
+  try {
+    const m = await bot.getChatMember(MOD_CHAT_ID, userId);
+    const result = ['creator', 'administrator', 'member'].includes(m.status);
+    modCache.set(String(userId), { result, expiry: Date.now() + MOD_CACHE_TTL });
+    return result;
+  } catch (e) { console.error('isModerator:', e.message); return false; }
 }
 
 // ======================= ИНИЦИАЛИЗАЦИЯ =======================
@@ -304,13 +295,6 @@ async function relocateAnswered(rec) {
   }
 }
 
-async function isModerator(userId) {
-  try {
-    const m = await bot.getChatMember(MOD_CHAT_ID, userId);
-    return ['creator', 'administrator', 'member'].includes(m.status);
-  } catch (e) { console.error('isModerator:', e.message); return false; }
-}
-
 // ======================= ОЧЕРЕДЬ =======================
 function queueText(rec, ahead) {
   const head = `✅ <b>Обращение принято</b>\n🆔 <code>${rec.id}</code>`;
@@ -332,7 +316,6 @@ async function updateQueue() {
         { chat_id: rec.userId, message_id: rec.userMsgId, parse_mode: 'HTML', reply_markup: cancelKb(rec.id) });
       rec.lastShownPos = i;
       persist();
-      touchUser(rec.userId);
     } catch {
       rec.lastShownPos = i;
     }
@@ -385,13 +368,13 @@ async function createSuggestion(msg, kind) {
 
     let conf;
     if (isBiz) {
-      conf = await replaceMsg(from.id, msg.chat.id,
+      conf = await bot.sendMessage(from.id,
         `💎 <b>Деловое предложение принято</b>\n🆔 <code>${rec.id}</code>\n\nПередано администрации напрямую — с вами свяжутся.`,
         { parse_mode: 'HTML', reply_markup: cancelKb(rec.id) });
     } else {
       const ahead = store.all().filter(r =>
         r.kind !== 'biz' && (r.state === 'new' || r.state === 'processing') && r.createdAt < rec.createdAt).length;
-      conf = await replaceMsg(from.id, msg.chat.id, queueText(rec, ahead),
+      conf = await bot.sendMessage(from.id, queueText(rec, ahead),
         { parse_mode: 'HTML', reply_markup: cancelKb(rec.id) });
       rec.lastShownPos = ahead;
     }
@@ -399,7 +382,7 @@ async function createSuggestion(msg, kind) {
     store.set(rec);
   } catch (e) {
     console.error('createSuggestion:', e.message);
-    await replaceMsg(from.id, msg.chat.id, '❌ Не удалось отправить предложение. Попробуйте позже.',
+    await bot.sendMessage(from.id, '❌ Не удалось отправить предложение. Попробуйте позже.',
       { reply_markup: HOME_KB }).catch(() => {});
   }
 }
@@ -413,12 +396,10 @@ async function rejectSuggestion(sid) {
   if (!wasAnswered) {
     muteUser(rec.userId);
     try {
-      await replaceMsg(rec.userId, rec.userId,
+      await bot.sendMessage(rec.userId,
         '🚫 <b>Обращение отклонено</b>\n\nК сожалению, ваше предложение отклонено администрацией.\n⏳ Отправить новое можно будет через 15 минут.',
         { parse_mode: 'HTML', reply_markup: HOME_KB });
     } catch {}
-  } else {
-    await clearUserMsg(rec.userId).catch(() => {});
   }
 
   store.del(sid);
@@ -441,9 +422,8 @@ async function cancelSuggestion(sid, q) {
   try {
     await bot.editMessageText('🚫 <b>Обращение отменено.</b>',
       { chat_id: rec.userId, message_id: rec.userMsgId, parse_mode: 'HTML', reply_markup: HOME_KB });
-    touchUser(rec.userId);
   } catch {
-    await replaceMsg(rec.userId, rec.userId, '🚫 <b>Обращение отменено.</b>',
+    await bot.sendMessage(rec.userId, '🚫 <b>Обращение отменено.</b>',
       { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
   }
 
@@ -454,8 +434,7 @@ async function cancelSuggestion(sid, q) {
 // ======================= ХЭНДЛЕРЫ =======================
 bot.onText(/^\/start/, async (msg) => {
   if (msg.chat.type !== 'private') return;
-  touchUser(msg.from.id);
-  await replaceMsg(msg.from.id, msg.chat.id, GREETING, { parse_mode: 'HTML' });
+  await bot.sendMessage(msg.chat.id, GREETING, { parse_mode: 'HTML' });
 });
 
 bot.on('message', async (msg) => {
@@ -468,14 +447,21 @@ bot.on('message', async (msg) => {
   if (msg.chat.type !== 'private') return;
   if (msg.text && msg.text.startsWith('/')) return;
 
-  touchUser(msg.from.id);
-
   const muteLeft = mutedFor(msg.from.id);
   if (muteLeft > 0) {
     const mins = Math.ceil(muteLeft / 60000);
-    await replaceMsg(msg.from.id, msg.chat.id,
+    await bot.sendMessage(msg.from.id,
       `⛔ <b>Вы недавно получили отказ.</b>\nОтправить новое обращение можно через ~${mins} мин.`,
       { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
+    return;
+  }
+
+  // один пользователь — одно активное обращение
+  const existing = store.all().find(r => String(r.userId) === String(msg.from.id) && r.state !== 'answered');
+  if (existing) {
+    await bot.sendMessage(msg.from.id,
+      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>\n\nДождитесь ответа или отмените его.`,
+      { parse_mode: 'HTML', reply_markup: cancelKb(existing.id) }).catch(() => {});
     return;
   }
 
@@ -490,27 +476,29 @@ bot.on('message', async (msg) => {
   // Pending-ack только для первого сообщения в буфере от этого пользователя.
   const alreadyWaiting = batchItems.some(it => it.msg.from.id === msg.from.id);
   if (!alreadyWaiting) {
-    await replaceMsg(msg.from.id, msg.chat.id, '⏳ <b>Получено</b> — определяем категорию...',
-      { parse_mode: 'HTML' }).catch(() => {});
+    const ackMsg = await bot.sendMessage(msg.from.id, '⏳ <b>Получено</b> — определяем категорию...',
+      { parse_mode: 'HTML' }).catch(() => null);
+    if (ackMsg) pendingAck.set(String(msg.from.id), { chatId: msg.chat.id, msgId: ackMsg.message_id });
   }
 
   batchItems.push({ id: ++batchSeq, msg });
 
-  if (batchItems.length >= BATCH_MAX) { flushBatch(); return; }
+  if (batchItems.length >= BATCH_MAX) { flushBatch().catch(e => console.error('flushBatch:', e.message)); return; }
   scheduleBatch();
 });
 
 bot.on('callback_query', async (q) => {
   const data = q.data || '';
-  touchUser(q.from.id);
   try {
     if (data === 'home') {
       try {
         await bot.editMessageText(GREETING, {
           chat_id: q.message.chat.id, message_id: q.message.message_id, parse_mode: 'HTML',
         });
-      } catch {
-        await replaceMsg(q.from.id, q.message.chat.id, GREETING, { parse_mode: 'HTML' }).catch(() => {});
+      } catch (e) {
+        if (!String(e.message).includes('message is not modified')) {
+          await bot.sendMessage(q.message.chat.id, GREETING, { parse_mode: 'HTML' }).catch(() => {});
+        }
       }
       await bot.answerCallbackQuery(q.id);
 
@@ -591,7 +579,7 @@ app.post('/api/answer', async (req, res) => {
   const isFirst = rec.state !== 'answered';
 
   try {
-    await replaceMsg(rec.userId, rec.userId,
+    await bot.sendMessage(rec.userId,
       `💬 <b>${isFirst ? 'Ответ администрации' : 'Дополнение к ответу'}</b>\n🆔 <code>${rec.id}</code>\n\n${esc(answer)}`,
       { parse_mode: 'HTML', reply_markup: HOME_KB });
   } catch (e) {
@@ -630,6 +618,15 @@ app.post(`/bot${TOKEN}`, (req, res) => {
   res.sendStatus(200);
 });
 
+// сброс буфера при перезапуске (Render SIGTERM)
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM: сбрасываю буфер перед завершением...');
+  if (batchItems.length) {
+    await flushBatch().catch(e => console.error('flushBatch on SIGTERM:', e.message));
+  }
+  process.exit(0);
+});
+
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`Сервер запущен на порту ${PORT}`);
   try {
@@ -639,6 +636,9 @@ app.listen(PORT, '0.0.0.0', async () => {
       console.warn(`⚠️ BOT_USERNAME (${BOT_USERNAME}) не совпадает с реальным (@${me.username})`);
     }
   } catch (e) { console.error('getMe:', e.message); }
+
+  const pendingCount = store.all().filter(r => r.state !== 'answered').length;
+  if (pendingCount) console.log(`ℹ️ В очереди при старте: ${pendingCount} обращений`);
 
   if (PUBLIC_URL) {
     try {
@@ -654,6 +654,6 @@ app.listen(PORT, '0.0.0.0', async () => {
   setInterval(() => {
     updateQueue().catch(e => console.error('updateQueue:', e.message));
     releaseStale().catch(e => console.error('releaseStale:', e.message));
-    cleanStaleUserMsgs().catch(e => console.error('cleanStaleUserMsgs:', e.message));
+    purgeExpiredMutes();
   }, 60000);
 });
