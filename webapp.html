@@ -130,6 +130,14 @@
   }
   .send-btn:disabled{opacity:.4;cursor:default}
   .send-btn:not(:disabled):active{transform:scale(.88)}
+  .toast{
+    position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 82px);
+    transform:translateX(-50%) translateY(12px);
+    background:rgba(0,0,0,.84);color:#fff;padding:9px 16px;border-radius:20px;font-size:13px;
+    opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:30;max-width:88%;text-align:center;
+    box-shadow:0 4px 18px rgba(0,0,0,.4);
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .hidden{display:none!important}
 </style>
 </head>
@@ -158,6 +166,8 @@
     </div>
     <button class="send-btn" id="send" disabled>➤</button>
   </footer>
+
+  <div id="toast" class="toast"></div>
 
 <script>
 const tg = window.Telegram && window.Telegram.WebApp;
@@ -226,6 +236,12 @@ function screen(kind, opts){
 
 function atBottom(){ return feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80; }
 
+let toastTimer=null;
+function toast(msg){
+  const t=$('toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2800);
+}
+
 function render(view){
   lastView = view;
   role = view.role;
@@ -234,7 +250,7 @@ function render(view){
 
   // header
   $('header').classList.remove('hidden');
-  $('hTitle').textContent = isMod ? (view.userMention || 'Подписчик') : 'Ваше обращение';
+  $('hTitle').textContent = isMod ? (view.userMention || 'Подписчик') : 'Администрация';
   $('hAva').textContent = isMod ? initials(view.userMention) : '🛡';
   $('hAva').className = 'h-ava' + (isMod ? '' : ' mod');
   $('hState').textContent = meta.label;
@@ -248,12 +264,12 @@ function render(view){
   input.disabled = !canWrite;
   input.placeholder = isMod
     ? (view.state==='answered' ? 'Дополнить ответ…' : 'Ваш ответ…')
-    : 'Сообщение…';
+    : (view.state==='answered' ? 'Дополнить обращение…' : 'Сообщение…');
   syncSendBtn();
 
   if (view.locked){
     $('banner').classList.remove('hidden');
-    $('banner').textContent = '🔒 Это обращение уже ведёт ' + (view.moderatorName || 'другой модератор');
+    $('banner').textContent = '🔒 Обращение уже обрабатывает другой модератор';
     $('composer').classList.add('hidden');
   } else {
     $('banner').classList.add('hidden');
@@ -295,12 +311,13 @@ function render(view){
 
     const ava=document.createElement('div');
     ava.className='ava';
-    ava.textContent = m.from==='mod' ? initials(m.by||'М') : initials(m.by||view.userMention);
+    ava.textContent = m.from==='mod' ? '🛡' : initials(m.by||view.userMention);
     row.appendChild(ava);
 
     const b=document.createElement('div'); b.className='bubble';
     const showWho = !mine; // подпись у чужих
-    const who = m.from==='mod' ? (m.by||'Модерация') : (isMod ? (m.by||'Подписчик') : 'Вы');
+    // Ответ всегда обезличен — «Администрация» (даже для исторических записей).
+    const who = m.from==='mod' ? 'Администрация' : (isMod ? (m.by||'Подписчик') : 'Вы');
     b.innerHTML =
       (showWho ? '<div class="who">'+esc(who)+'</div>' : '') +
       esc(m.text) +
@@ -340,8 +357,7 @@ async function doSend(){
     input.value=''; autoGrow();
     if (view.switchTo && view.switchTo !== sid){
       sid = view.switchTo;
-      renderedKey='';
-      if (tg && tg.showPopup){ /* без модалки, тихо */ }
+      toast('Отправлено как новое обращение — с контекстом переписки');
     }
     renderedKey='';
     render(view);

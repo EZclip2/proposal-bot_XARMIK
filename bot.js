@@ -22,6 +22,9 @@ if (!TOKEN || !MOD_CHAT_ID || !BOT_USERNAME || !APP_NAME) {
   process.exit(1);
 }
 
+// Подписчик всегда видит ответ «от Администрации» — личный юзернейм/имя модератора не раскрываем.
+const MOD_LABEL = 'Администрация';
+
 // ======================= ДЕТЕКТОР СПАМА (без ИИ) =======================
 const userMsgLog   = new Map();
 const userLastText = new Map();
@@ -227,7 +230,7 @@ if (!db.mutes) db.mutes = {};
       msgs.push({ from: 'user', by: rec.userMention || 'Пользователь', text: rec.bodyText, time: t0 });
     }
     (rec.answers || []).forEach((a, i) => {
-      msgs.push({ from: 'mod', by: a.by || 'Модерация', text: a.text || '', time: t0 + (i + 1) });
+      msgs.push({ from: 'mod', by: MOD_LABEL, text: a.text || '', time: t0 + (i + 1) });
     });
     rec.messages = msgs;
     if (rec.parentId === undefined) rec.parentId = null;
@@ -507,13 +510,13 @@ async function createFollowupTicket(parent, text) {
   } catch (e) { console.error('createFollowupTicket:', e.message); return null; }
 }
 
-// Общая логика ответа модератора — из мини-аппа И из реплая в группе.
+// Общая логика ответа модератора — из мини-аппа И из реплая в группе. Всегда обезличено.
 async function applyModAnswer(rec, modUser, text) {
   const isFirst = rec.state !== 'answered';
   rec.messages = rec.messages || [];
-  rec.messages.push({ from: 'mod', by: modName(modUser), text, time: Date.now() });
+  rec.messages.push({ from: 'mod', by: MOD_LABEL, text, time: Date.now() });
   rec.moderatorId = modUser.id;
-  rec.moderatorName = modName(modUser);
+  rec.moderatorName = MOD_LABEL;
   if (isFirst) rec.state = 'answered';
   store.set(rec);
 
@@ -717,7 +720,6 @@ function authUser(req, res) {
   if (!user || !user.id) { res.status(403).json({ error: 'Некорректная подпись' }); return null; }
   return user;
 }
-const modName = (u) => (u.username ? '@' + u.username : (u.first_name || 'модератор'));
 
 async function roleFor(rec, user) {
   if (rec && String(rec.userId) === String(user.id)) return 'user';
@@ -756,7 +758,7 @@ app.post('/api/open', async (req, res) => {
     if (rec.state === 'new') {
       rec.state = 'processing';
       rec.moderatorId = user.id;
-      rec.moderatorName = modName(user);
+      rec.moderatorName = MOD_LABEL;
       rec.processingAt = Date.now();
       store.set(rec);
       await refreshCard(rec);
