@@ -147,48 +147,77 @@ function scheduleBatch() {
   batchTimer = setTimeout(flushBatch, Math.max(0, batchDeadline - Date.now()));
 }
 
-async function classifyBatch(items) {
-  const result = new Map(items.map(i => [i.id, { cat: 'reg', mute: false, reply: '' }]));
-  if (!AI_API_KEY || !items.length) return result;
-  const ctrl = new AbortController();
-  const abortTimer = setTimeout(() => ctrl.abort(), 20000);
-  try {
-    const resp = await fetch(`${AI_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
-      body: JSON.stringify({
-        model: AI_MODEL, temperature: 0, max_tokens: 100 * items.length + 50,
-        messages: [
-          { role: 'system', content: AI_SYSTEM },
-          { role: 'user', content: JSON.stringify(items) },
-        ],
-      }),
-      signal: ctrl.signal,
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content || '';
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON in LLM response');
-    const parsed = JSON.parse(jsonMatch[0]);
-    const VALID = new Set(['trash', 'biz', 'reg']);
-    for (const r of (parsed.results || [])) {
-      if (result.has(r.id)) {
-        const cat = VALID.has(r.cat) ? r.cat : 'reg';
-        result.set(r.id, {
-          cat,
-          mute:  cat === 'trash' && r.mute === true,
-          reply: String(r.reply || ''),
-        });
-      }
-    }
-    console.log(`classifyBatch: ${items.length} msg → [${[...result.values()].map(v => v.cat + (v.mute ? '+mute' : '')).join(', ')}]`);
-  } catch (e) {
-    console.error('classifyBatch:', e.message);
-  } finally {
-    clearTimeout(abortTimer);
+// Извлекает JSON из ответа LLM: убирает ```json-обёртку, при необходимости
+// вырезает первый {...}-блок из окружающего текста.
+function parseAiJson(content) {
+  if (!content || !content.trim()) throw new Error('no json in LLM response (пустой content)');
+  const cleaned = content.trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+  try { return JSON.parse(cleaned); } catch {}
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (match) {
+    try { return JSON.parse(match[0]); } catch {}
   }
-  return result;
+  throw new Error('no json in LLM response: ' + cleaned.slice(0, 200));
+}
+
+async function classifyBatch(items) {
+  const fallback = () => new Map(items.map(i => [i.id, { cat: 'reg', mute: false, reply: '' }]));
+  if (!AI_API_KEY || !items.length) return fallback();
+
+  const VALID = new Set(['trash', 'biz', 'reg']);
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const ctrl = new AbortController();
+    const abortTimer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const resp = await fetch(`${AI_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AI_API_KEY}` },
+        body: JSON.stringify({
+          model: AI_MODEL, temperature: 0, max_tokens: 100 * items.length + 50,
+          // Просим провайдера гарантировать JSON-ответ. Провайдеры/модели, которые
+          // не умеют — просто проигнорируют это поле, а не упадут (проверено на
+          // OpenRouter/Groq/DeepSeek); дальше всё равно есть защитный парсер.
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: AI_SYSTEM },
+            { role: 'user', content: JSON.stringify(items) },
+          ],
+        }),
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
+      const data = await resp.json();
+      const content = data?.choices?.[0]?.message?.content || '';
+      const parsed = parseAiJson(content);
+
+      const result = fallback();
+      for (const r of (parsed.results || [])) {
+        if (result.has(r.id)) {
+          const cat = VALID.has(r.cat) ? r.cat : 'reg';
+          result.set(r.id, {
+            cat,
+            mute:  cat === 'trash' && r.mute === true,
+            reply: String(r.reply || ''),
+          });
+        }
+      }
+      console.log(`classifyBatch: ${items.length} msg → [${[...result.values()].map(v => v.cat + (v.mute ? '+mute' : '')).join(', ')}]`);
+      return result;
+    } catch (e) {
+      console.error(`classifyBatch (попытка ${attempt}/2):`, e.message);
+      if (attempt === 2) {
+        console.error('classifyBatch: ИИ недоступен — весь батч уходит как "reg" (без блокировки).');
+        return fallback();
+      }
+    } finally {
+      clearTimeout(abortTimer);
+    }
+  }
+  return fallback();
 }
 
 if (AI_API_KEY) console.log(`ИИ-фильтр включён (батчинг): ${AI_MODEL} @ ${AI_BASE_URL}`);
@@ -258,6 +287,7 @@ const bot = new TelegramBot(TOKEN, { polling: false });
 const app = express();
 app.use(express.json());
 app.get('/webapp.html', (req, res) => res.sendFile(path.join(__dirname, 'webapp.html')));
+app.get('/my-tickets.html', (req, res) => res.sendFile(path.join(__dirname, 'my-tickets.html')));
 
 const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const clampCaption = (t) => (t.length > 1024 ? t.slice(0, 1015) + '…' : t);
@@ -270,6 +300,12 @@ const GREETING =
 
 const HOME_KB  = { inline_keyboard: [[{ text: '🔙 В начало', callback_data: 'home' }]] };
 const cancelKb = (sid) => ({ inline_keyboard: [[{ text: '❌ Отменить обращение', callback_data: `cancel:${sid}` }]] });
+
+// Кнопка отслеживания обращений — обычный web_app-button работает в личке
+// (в отличие от карточек в группе-модерации, см. README).
+const GREETING_KB = PUBLIC_URL
+  ? { inline_keyboard: [[{ text: '📋 Мои обращения', web_app: { url: `${PUBLIC_URL}/my-tickets.html` } }]] }
+  : undefined;
 
 function hasMedia(msg) {
   return !!(msg.photo || msg.video || msg.document || msg.voice || msg.audio ||
@@ -484,7 +520,7 @@ async function cancelSuggestion(sid, q) {
 // ======================= ХЭНДЛЕРЫ =======================
 bot.onText(/^\/start/, async (msg) => {
   if (msg.chat.type !== 'private') return;
-  await bot.sendMessage(msg.chat.id, GREETING, { parse_mode: 'HTML' });
+  await bot.sendMessage(msg.chat.id, GREETING, { parse_mode: 'HTML', reply_markup: GREETING_KB });
 });
 
 bot.on('message', async (msg) => {
@@ -557,10 +593,11 @@ bot.on('callback_query', async (q) => {
       try {
         await bot.editMessageText(GREETING, {
           chat_id: q.message.chat.id, message_id: q.message.message_id, parse_mode: 'HTML',
+          reply_markup: GREETING_KB,
         });
       } catch (e) {
         if (!String(e.message).includes('message is not modified')) {
-          await bot.sendMessage(q.message.chat.id, GREETING, { parse_mode: 'HTML' }).catch(() => {});
+          await bot.sendMessage(q.message.chat.id, GREETING, { parse_mode: 'HTML', reply_markup: GREETING_KB }).catch(() => {});
         }
       }
       await bot.answerCallbackQuery(q.id);
@@ -607,6 +644,13 @@ async function authMiniApp(req, res) {
   return user;
 }
 const modName = (u) => (u.username ? '@' + u.username : (u.first_name || 'модератор'));
+
+// Для мини-аппа подписчика модераторская проверка не нужна — только подпись initData.
+function authSubscriber(req, res) {
+  const user = checkInitData((req.body && req.body.initData) || '');
+  if (!user || !user.id) { res.status(403).json({ error: 'Некорректная подпись' }); return null; }
+  return user;
+}
 
 // ======================= API МИНИ-ПРИЛОЖЕНИЯ =======================
 app.post('/api/open', async (req, res) => {
@@ -671,6 +715,27 @@ app.post('/api/reject', async (req, res) => {
   const user = await authMiniApp(req, res); if (!user) return;
   await rejectSuggestion(req.body.sid);
   res.json({ ok: true });
+});
+
+app.post('/api/my-tickets', (req, res) => {
+  const user = authSubscriber(req, res); if (!user) return;
+
+  const tickets = store.all()
+    .filter(r => String(r.userId) === String(user.id))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+    .map(r => ({
+      id: r.id,
+      kind: r.kind,
+      state: r.state,
+      bodyText: r.bodyText,
+      isMedia: r.isMedia,
+      answersText: (r.answers || []).length
+        ? r.answers.map((a, i) => `${i === 0 ? 'Ответ' : 'Дополнение'} (${a.by}): ${a.text}`).join('\n\n')
+        : null,
+      createdAt: r.createdAt,
+    }));
+
+  res.json({ tickets });
 });
 
 // ======================= WEBHOOK И ЗАПУСК =======================

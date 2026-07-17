@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Мои обращения</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #131b24; --panel: #0f161e; --line: #24313d; --muted: #7d8b99;
+    --text: #e6edf3; --accent: #6ab3f3; --ok: #6ee787; --danger: #f77e7e; --warn: #f7c05e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); min-height: 100vh;
+  }
+  h1 { font-size: 17px; margin-bottom: 4px; }
+  .sub { font-size: 12.5px; color: var(--muted); margin-bottom: 16px; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab {
+    flex: 1; text-align: center; padding: 9px 6px; border-radius: 10px;
+    font-size: 12.5px; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); cursor: pointer;
+  }
+  .tab.active { color: var(--text); background: #1b2530; border-color: #3a4a58; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 13px 14px; margin-bottom: 10px;
+  }
+  .card .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .num { font-size: 11px; color: var(--muted); }
+  .status { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px; }
+  .status.new { background: rgba(247,192,94,.15); color: var(--warn); }
+  .status.processing { background: rgba(106,179,243,.15); color: var(--accent); }
+  .status.answered { background: rgba(110,231,135,.15); color: var(--ok); }
+  .status.rejected { background: rgba(247,126,126,.15); color: var(--danger); }
+
+  .body-text { font-size: 14px; color: #d3dde6; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; margin-bottom: 8px; }
+  .biz-tag { font-size: 11px; color: #b18cff; margin-bottom: 6px; }
+
+  .answer-block {
+    background: #0d1b12; border: 1px solid #1e3a26; border-radius: 10px;
+    padding: 10px 11px; margin-top: 8px;
+  }
+  .answer-block .who { font-size: 11px; color: var(--ok); margin-bottom: 4px; }
+  .answer-block .txt { font-size: 13.5px; color: #cfe8d6; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
+
+  .date { font-size: 11px; color: var(--muted); margin-top: 8px; }
+
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; font-size: 14px; line-height: 1.6; }
+  .empty .icon { font-size: 32px; margin-bottom: 10px; }
+
+  .center { text-align: center; color: var(--muted); padding: 40px 0; font-size: 14px; }
+  .refresh-hint { text-align: center; font-size: 11px; color: var(--muted); margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<h1>Мои обращения</h1>
+<div class="sub" id="subhead">Загрузка…</div>
+
+<div class="tabs">
+  <div class="tab active" data-filter="all">Все</div>
+  <div class="tab" data-filter="open">В работе</div>
+  <div class="tab" data-filter="answered">Отвечено</div>
+</div>
+
+<div id="list">
+  <div class="center">Загрузка…</div>
+</div>
+
+<div class="refresh-hint">Список обновляется каждый раз при открытии</div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready(); tg.expand();
+
+const initData = tg.initData;
+const API = window.location.origin;
+const $ = (id) => document.getElementById(id);
+
+const STATUS_LABEL = {
+  new: 'Новое', processing: 'Обрабатывается', answered: 'Отвечено', rejected: 'Отклонено'
+};
+
+let allTickets = [];
+let currentFilter = 'all';
+
+function fmtDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }) + ' в ' +
+         d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+}
+
+function render() {
+  const list = $('list');
+  let items = allTickets;
+  if (currentFilter === 'open') items = items.filter(t => t.state === 'new' || t.state === 'processing');
+  if (currentFilter === 'answered') items = items.filter(t => t.state === 'answered');
+
+  if (!items.length) {
+    list.innerHTML = '<div class="empty"><div class="icon">🗂️</div>У вас пока нет обращений в этой категории</div>';
+    return;
+  }
+
+  list.innerHTML = items.map(t => {
+    const answerHtml = (t.state === 'answered' && t.answersText)
+      ? `<div class="answer-block"><div class="who">Ответ модератора</div><div class="txt">${escapeHtml(t.answersText)}</div></div>`
+      : '';
+    const bizTag = t.kind === 'biz' ? '<div class="biz-tag">💎 Деловое предложение</div>' : '';
+    return `
+      <div class="card">
+        <div class="top">
+          <span class="num">🆔 ${t.id}</span>
+          <span class="status ${t.state}">${STATUS_LABEL[t.state] || t.state}</span>
+        </div>
+        ${bizTag}
+        <div class="body-text">${escapeHtml(t.bodyText || '(без текста)')}</div>
+        ${answerHtml}
+        <div class="date">${fmtDate(t.createdAt)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentFilter = tab.dataset.filter;
+    render();
+  });
+});
+
+(async () => {
+  try {
+    const res = await fetch(API + '/api/my-tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initData }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Ошибка сервера');
+
+    allTickets = data.tickets || [];
+    allTickets.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    $('subhead').textContent = allTickets.length
+      ? `Всего обращений: ${allTickets.length}`
+      : 'Обращений пока нет';
+
+    render();
+  } catch (err) {
+    $('list').innerHTML = '';
+    $('subhead').textContent = '';
+    $('list').innerHTML = `<div class="center">${escapeHtml(err.message)}</div>`;
+  }
+})();
+</script>
+</body>
+</html>
