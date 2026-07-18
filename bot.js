@@ -22,6 +22,13 @@ if (!TOKEN || !MOD_CHAT_ID || !BOT_USERNAME || !APP_NAME) {
   process.exit(1);
 }
 
+// Диагностика тем: если ID не число — перенос/публикация в тему работать не будут.
+for (const [name, val] of [['TOPIC_NEW', TOPIC_NEW], ['TOPIC_ANSWERED', TOPIC_ANSWERED], ['TOPIC_BIZ', TOPIC_BIZ]]) {
+  if (val && Number.isNaN(Number(val))) {
+    console.warn(`⚠️ ${name}="${val}" — не число. Узнайте ID: отправьте /topic внутри нужной темы в чате модерации.`);
+  }
+}
+
 // Подписчик всегда видит ответ «от Администрации» — личный юзернейм/имя модератора не раскрываем.
 const MOD_LABEL = 'Администрация';
 // Через сколько после последнего ответа админа можно обработать без ответа пользователя.
@@ -426,9 +433,14 @@ async function refreshCard(rec) {
 
 // Перенос карточки в тему «Обработанные» (при закрытии обращения).
 async function relocateToAnswered(rec) {
+  const topicId = Number(TOPIC_ANSWERED);
+  if (Number.isNaN(topicId)) {
+    console.error(`relocateToAnswered(${rec.id}): TOPIC_ANSWERED="${TOPIC_ANSWERED}" не число — карточка осталась на месте.`);
+    return refreshCard(rec);
+  }
   const kb = cardKeyboard(rec.id, 'closed');
   const text = cardText(rec);
-  const thread = { message_thread_id: Number(TOPIC_ANSWERED) };
+  const thread = { message_thread_id: topicId };
   try {
     let sent;
     if (rec.isMedia) {
@@ -442,10 +454,11 @@ async function relocateToAnswered(rec) {
     rec.modMessageId = sent.message_id;
     store.set(rec);
     try { await bot.deleteMessage(MOD_CHAT_ID, oldId); } catch {}
+    console.log(`relocateToAnswered(${rec.id}): перенесено в тему ${topicId}.`);
   } catch (e) {
     // Не удалось перенести (тема не найдена/закрыта/неверный TOPIC_ANSWERED) — логируем причину
     // и хотя бы обновляем статус карточки на месте, чтобы обращение не «зависло».
-    console.error(`relocateToAnswered(${rec.id}) → тема "${TOPIC_ANSWERED}":`, e.message);
+    console.error(`relocateToAnswered(${rec.id}) → тема ${topicId}:`, e.message);
     await refreshCard(rec);
   }
 }
@@ -591,6 +604,7 @@ async function applyModAnswer(rec, modUser, text) {
   rec.moderatorId = modUser.id;
   rec.moderatorName = MOD_LABEL;
   rec.state = 'answered';      // диалог открыт; закрытие — только вручную
+  rec.closedBy = null;         // возможное возобновление после закрытия админом
   rec._gateOk = false;
   store.set(rec);
 
@@ -681,8 +695,9 @@ async function handleModGroupReply(msg) {
   if (!body || body.startsWith('/')) return;
 
   const rec = store.all().find(r => r.modMessageId === replyTo.message_id);
-  if (!rec) return;                      // реплай не на карточку — игнор
-  if (rec.state === 'closed') return;    // обработанное не трогаем
+  if (!rec) return;                                          // реплай не на карточку — игнор
+  // Закрытое пользователем — трогать нельзя. Закрытое админом — можно возобновить реплаем.
+  if (rec.state === 'closed' && rec.closedBy === 'user') return;
   if (!(await isModerator(msg.from.id))) return;
 
   await applyModAnswer(rec, msg.from, body).catch(e => console.error('groupReply:', e.message));
@@ -839,6 +854,9 @@ async function roleFor(rec, user) {
 
 function viewFor(rec, role, user) {
   const modGate = role === 'mod' ? canModClose(rec) : { ok: true, reason: '' };
+  const closedByUser = rec.state === 'closed' && rec.closedBy === 'user';
+  // Админ может писать всегда, кроме случая, когда обращение закрыл сам пользователь.
+  const modCanReply = role === 'mod' && !closedByUser;
   return {
     id: rec.id,
     kind: rec.kind,
@@ -850,9 +868,11 @@ function viewFor(rec, role, user) {
     moderatorName: rec.moderatorName || null,
     messages: realMsgsAndCtx(rec),
     locked: role === 'mod' && rec.moderatorId &&
-            String(rec.moderatorId) !== String(user.id) && rec.state !== 'closed',
+            String(rec.moderatorId) !== String(user.id) && rec.state !== 'closed' && rec.state !== 'answered',
     closed: rec.state === 'closed',
+    closedBy: rec.closedBy || null,
     closable: rec.state === 'answered',          // «Завершить/Обработать» доступно в диалоге
+    modCanReply,                                 // мини-апп: показывать ли админу поле ввода
     closeEnabled: role === 'user' ? true : modGate.ok,
     closeHint: role === 'mod' ? modGate.reason : '',
   };
@@ -901,8 +921,12 @@ app.post('/api/send', async (req, res) => {
 
   // ---- Модератор ----
   if (role === 'mod') {
-    if (rec.state === 'closed') return res.status(409).json({ error: 'Обращение уже обработано' });
-    if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
+    if (rec.state === 'closed') {
+      // Закрыл пользователь → админ писать не может. Закрыл админ → можно возобновить диалог.
+      if (rec.closedBy === 'user') {
+        return res.status(409).json({ error: 'Пользователь завершил обращение — писать больше нельзя.' });
+      }
+    } else if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
       return res.status(409).json({ error: 'Обращение уже обрабатывает другой модератор' });
     }
     await applyModAnswer(rec, user, text);
