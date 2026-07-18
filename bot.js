@@ -719,6 +719,20 @@ bot.on('message', async (msg) => {
         { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
       return;
     }
+    // Диагностика переноса: пробует опубликовать в TOPIC_ANSWERED и сразу сообщает результат.
+    if (msg.text && /^\/testanswered\b/.test(msg.text)) {
+      const tid = Number(TOPIC_ANSWERED);
+      const reply = (t) => bot.sendMessage(MOD_CHAT_ID, t, { message_thread_id: msg.message_thread_id }).catch(() => {});
+      if (!TOPIC_ANSWERED)   { await reply('TOPIC_ANSWERED не задан.'); return; }
+      if (Number.isNaN(tid)) { await reply(`TOPIC_ANSWERED="${TOPIC_ANSWERED}" — не число.`); return; }
+      try {
+        const t = await bot.sendMessage(MOD_CHAT_ID, '✅ Тест переноса в «Обработанные».', { message_thread_id: tid });
+        await reply(`OK: опубликовано в тему ${tid} (msg ${t.message_id}). Перенос будет работать.`);
+      } catch (e) {
+        await reply(`❌ Публикация в тему ${tid} не удалась: ${e.message}`);
+      }
+      return;
+    }
     await handleModGroupReply(msg).catch(e => console.error('handleModGroupReply:', e.message));
     return;
   }
@@ -855,23 +869,27 @@ async function roleFor(rec, user) {
 function viewFor(rec, role, user) {
   const modGate = role === 'mod' ? canModClose(rec) : { ok: true, reason: '' };
   const closedByUser = rec.state === 'closed' && rec.closedBy === 'user';
-  // Админ может писать всегда, кроме случая, когда обращение закрыл сам пользователь.
+  const closedByMod  = rec.state === 'closed' && rec.closedBy === 'mod';
+  // Админ может дополнять обращение, которое закрыл сам (но не то, что закрыл пользователь).
   const modCanReply = role === 'mod' && !closedByUser;
+  // Чтобы мини-апп показал админу поле ввода, обращение, закрытое администрацией,
+  // отдаём ему как активный диалог (реально возобновится, когда он напишет).
+  const effState = (role === 'mod' && closedByMod) ? 'answered' : rec.state;
   return {
     id: rec.id,
     kind: rec.kind,
     role,
     userMention: rec.userMention,
     userId: rec.userId,
-    state: rec.state,
+    state: effState,
     parentId: rec.parentId || null,
     moderatorName: rec.moderatorName || null,
     messages: realMsgsAndCtx(rec),
     locked: role === 'mod' && rec.moderatorId &&
             String(rec.moderatorId) !== String(user.id) && rec.state !== 'closed' && rec.state !== 'answered',
-    closed: rec.state === 'closed',
+    closed: effState === 'closed',
     closedBy: rec.closedBy || null,
-    closable: rec.state === 'answered',          // «Завершить/Обработать» доступно в диалоге
+    closable: effState === 'answered',           // «Завершить/Обработать» доступно в диалоге
     modCanReply,                                 // мини-апп: показывать ли админу поле ввода
     closeEnabled: role === 'user' ? true : modGate.ok,
     closeHint: role === 'mod' ? modGate.reason : '',
