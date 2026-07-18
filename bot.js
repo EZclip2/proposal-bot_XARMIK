@@ -604,7 +604,6 @@ async function applyModAnswer(rec, modUser, text) {
   rec.moderatorId = modUser.id;
   rec.moderatorName = MOD_LABEL;
   rec.state = 'answered';      // диалог открыт; закрытие — только вручную
-  rec.closedBy = null;         // возможное возобновление после закрытия админом
   rec._gateOk = false;
   store.set(rec);
 
@@ -624,6 +623,7 @@ async function closeSuggestion(rec, by) {
   rec.closedBy = by;
   rec.processingAt = null;
   store.set(rec);
+  console.log(`closeSuggestion: ${rec.id} by=${by} kind=${rec.kind} TOPIC_ANSWERED=${TOPIC_ANSWERED || '—'}`);
 
   if (by === 'mod') {
     await bot.sendMessage(rec.userId,
@@ -695,9 +695,8 @@ async function handleModGroupReply(msg) {
   if (!body || body.startsWith('/')) return;
 
   const rec = store.all().find(r => r.modMessageId === replyTo.message_id);
-  if (!rec) return;                                          // реплай не на карточку — игнор
-  // Закрытое пользователем — трогать нельзя. Закрытое админом — можно возобновить реплаем.
-  if (rec.state === 'closed' && rec.closedBy === 'user') return;
+  if (!rec) return;                    // реплай не на карточку — игнор
+  if (rec.state === 'closed') return;  // обработанное не трогаем — дополнять нельзя
   if (!(await isModerator(msg.from.id))) return;
 
   await applyModAnswer(rec, msg.from, body).catch(e => console.error('groupReply:', e.message));
@@ -868,29 +867,21 @@ async function roleFor(rec, user) {
 
 function viewFor(rec, role, user) {
   const modGate = role === 'mod' ? canModClose(rec) : { ok: true, reason: '' };
-  const closedByUser = rec.state === 'closed' && rec.closedBy === 'user';
-  const closedByMod  = rec.state === 'closed' && rec.closedBy === 'mod';
-  // Админ может дополнять обращение, которое закрыл сам (но не то, что закрыл пользователь).
-  const modCanReply = role === 'mod' && !closedByUser;
-  // Чтобы мини-апп показал админу поле ввода, обращение, закрытое администрацией,
-  // отдаём ему как активный диалог (реально возобновится, когда он напишет).
-  const effState = (role === 'mod' && closedByMod) ? 'answered' : rec.state;
   return {
     id: rec.id,
     kind: rec.kind,
     role,
     userMention: rec.userMention,
     userId: rec.userId,
-    state: effState,
+    state: rec.state,
     parentId: rec.parentId || null,
     moderatorName: rec.moderatorName || null,
     messages: realMsgsAndCtx(rec),
     locked: role === 'mod' && rec.moderatorId &&
             String(rec.moderatorId) !== String(user.id) && rec.state !== 'closed' && rec.state !== 'answered',
-    closed: effState === 'closed',
+    closed: rec.state === 'closed',
     closedBy: rec.closedBy || null,
-    closable: effState === 'answered',           // «Завершить/Обработать» доступно в диалоге
-    modCanReply,                                 // мини-апп: показывать ли админу поле ввода
+    closable: rec.state === 'answered',          // «Завершить/Обработать» доступно в диалоге
     closeEnabled: role === 'user' ? true : modGate.ok,
     closeHint: role === 'mod' ? modGate.reason : '',
   };
@@ -939,12 +930,11 @@ app.post('/api/send', async (req, res) => {
 
   // ---- Модератор ----
   if (role === 'mod') {
+    // Обработанное обращение админ дополнять НЕ может — ни при каких условиях.
     if (rec.state === 'closed') {
-      // Закрыл пользователь → админ писать не может. Закрыл админ → можно возобновить диалог.
-      if (rec.closedBy === 'user') {
-        return res.status(409).json({ error: 'Пользователь завершил обращение — писать больше нельзя.' });
-      }
-    } else if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
+      return res.status(409).json({ error: 'Обращение обработано — писать больше нельзя.' });
+    }
+    if (rec.moderatorId && String(rec.moderatorId) !== String(user.id) && rec.state !== 'answered') {
       return res.status(409).json({ error: 'Обращение уже обрабатывает другой модератор' });
     }
     await applyModAnswer(rec, user, text);
