@@ -122,7 +122,7 @@ async function flushBatch() {
       } else {
         const text = (reply && reply.trim())
           ? reply
-          : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПожалуйста, переформулируйте — опишите предложение, вопрос или отзыв понятнее и по существу.';
+          : '🤔 <b>Не удалось понять суть обращения.</b>\n\nПереформулируйте, пожалуйста, — по существу.';
         await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       }
     } else {
@@ -336,8 +336,8 @@ const webAppUrl = (sid) => `https://t.me/${BOT_USERNAME}/${APP_NAME}?startapp=${
 
 const GREETING =
   '👋 <b>Привет!</b>\n\n' +
-  'Напиши своё предложение, идею, вопрос, отзыв или деловое предложение <b>одним сообщением</b> — ' +
-  'я сам определю категорию и передам администрации. Дальше общение идёт в приложении-переписке.';
+  'Напиши предложение, вопрос, отзыв или деловое предложение <b>одним сообщением</b> — ' +
+  'я определю категорию и передам администрации. Дальше — в приложении-переписке.';
 
 const HOME_KB  = { inline_keyboard: [[{ text: '🔙 В начало', callback_data: 'home' }]] };
 const openAppKb = (sid, label) => ({ inline_keyboard: [[{ text: label || '💬 Открыть переписку', url: webAppUrl(sid) }]] });
@@ -390,15 +390,14 @@ function cardText(rec) {
   const isBiz = rec.kind === 'biz';
   const noun = isBiz ? 'деловое предложение' : 'обращение';
   const gem  = isBiz ? '💎 ' : '';
-  const ctx  = rec.parentId ? `\n🔁 Продолжение обращения <code>${rec.parentId}</code>` : '';
+  const ctx  = rec.parentId ? `\n🔁 Продолжение <code>${rec.parentId}</code>` : '';
   const head =
     `👤 ${esc(rec.userMention)}  ·  🆔 <code>${rec.id}</code>\n` +
     `<code>[user: ${rec.userId}]</code>${ctx}`;
   const real = realMsgs(rec);
   const fromUser = real.filter(m => m.from === 'user').length;
   const fromMod  = real.filter(m => m.from === 'mod').length;
-  const foot = `\n\n💬 Сообщений: <b>${real.length}</b> (👤 ${fromUser} · 🛡 ${fromMod})\n` +
-               `<i>Текст — внутри приложения. Ответить можно кнопкой ниже или реплаем на это сообщение.</i>`;
+  const foot = `\n\n💬 <b>${real.length}</b> · 👤 ${fromUser} · 🛡 ${fromMod}`;
 
   if (rec.state === 'new')        return `${isBiz ? '💎' : '🟡'} <b>Новое ${noun}</b>\n${head}${foot}`;
   if (rec.state === 'processing') return `${gem}🟠 <b>В работе</b> · ${esc(rec.moderatorName)}\n${head}${foot}`;
@@ -429,21 +428,24 @@ async function refreshCard(rec) {
 async function relocateToAnswered(rec) {
   const kb = cardKeyboard(rec.id, 'closed');
   const text = cardText(rec);
+  const thread = { message_thread_id: Number(TOPIC_ANSWERED) };
   try {
     let sent;
     if (rec.isMedia) {
       sent = await bot.copyMessage(MOD_CHAT_ID, MOD_CHAT_ID, rec.modMessageId,
-        { message_thread_id: Number(TOPIC_ANSWERED), caption: clampCaption(text), parse_mode: 'HTML', reply_markup: kb });
+        { ...thread, caption: clampCaption(text), parse_mode: 'HTML', reply_markup: kb });
     } else {
       sent = await bot.sendMessage(MOD_CHAT_ID, text,
-        { message_thread_id: Number(TOPIC_ANSWERED), parse_mode: 'HTML', reply_markup: kb });
+        { ...thread, parse_mode: 'HTML', reply_markup: kb });
     }
     const oldId = rec.modMessageId;
     rec.modMessageId = sent.message_id;
     store.set(rec);
     try { await bot.deleteMessage(MOD_CHAT_ID, oldId); } catch {}
   } catch (e) {
-    console.error('relocateToAnswered:', e.message);
+    // Не удалось перенести (тема не найдена/закрыта/неверный TOPIC_ANSWERED) — логируем причину
+    // и хотя бы обновляем статус карточки на месте, чтобы обращение не «зависло».
+    console.error(`relocateToAnswered(${rec.id}) → тема "${TOPIC_ANSWERED}":`, e.message);
     await refreshCard(rec);
   }
 }
@@ -451,8 +453,8 @@ async function relocateToAnswered(rec) {
 // ======================= ОЧЕРЕДЬ =======================
 function queueText(rec, ahead) {
   const head = `✅ <b>Обращение принято</b>\n🆔 <code>${rec.id}</code>`;
-  if (ahead <= 0) return `${head}\n\n⏳ Вы <b>первый</b> в очереди — скоро ответим 💜\n<i>Общаться можно в приложении.</i>`;
-  return `${head}\n\n⏳ Перед вами в очереди: <b>${ahead}</b>\n<i>Статус обновляется автоматически. Переписка — в приложении.</i>`;
+  if (ahead <= 0) return `${head}\n\n⏳ Вы <b>первый</b> в очереди.`;
+  return `${head}\n\n⏳ Перед вами в очереди: <b>${ahead}</b>`;
 }
 
 async function updateQueue() {
@@ -534,7 +536,7 @@ async function createSuggestion(msg, kind) {
     let conf;
     if (isBiz) {
       conf = await bot.sendMessage(from.id,
-        `💎 <b>Деловое предложение принято</b>\n🆔 <code>${rec.id}</code>\n\nОткройте приложение, чтобы общаться с администрацией.`,
+        `💎 <b>Деловое предложение принято</b>\n🆔 <code>${rec.id}</code>`,
         { parse_mode: 'HTML', reply_markup: userKb(rec.id) });
     } else {
       const ahead = store.all().filter(r =>
@@ -575,7 +577,7 @@ async function createFollowupTicket(parent, text) {
     store.set(rec);
 
     const conf = await bot.sendMessage(rec.userId,
-      `🔁 <b>Обращение дополнено и отправлено заново</b>\n🆔 <code>${rec.id}</code>\n\nПрошлая переписка сохранена как контекст. Продолжайте в приложении.`,
+      `🔁 <b>Обращение отправлено заново</b>\n🆔 <code>${rec.id}</code>\n\nПрошлая переписка сохранена как контекст.`,
       { parse_mode: 'HTML', reply_markup: userKb(rec.id) }).catch(() => null);
     if (conf) { rec.userMsgId = conf.message_id; store.set(rec); }
     return rec;
@@ -594,7 +596,7 @@ async function applyModAnswer(rec, modUser, text) {
 
   try {
     await bot.sendMessage(rec.userId,
-      `💬 <b>Вам ответили</b>\n🆔 <code>${rec.id}</code>\n\nОткройте переписку, чтобы прочитать и продолжить.`,
+      `💬 <b>Вам ответили</b>\n🆔 <code>${rec.id}</code>`,
       { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) });
   } catch (e) { console.error('deliver:', e.message); }
 
@@ -611,12 +613,18 @@ async function closeSuggestion(rec, by) {
 
   if (by === 'mod') {
     await bot.sendMessage(rec.userId,
-      `✅ <b>Обращение обработано</b>\n🆔 <code>${rec.id}</code>\n\nСпасибо! Если появится новый вопрос — просто напишите, и мы учтём эту переписку.`,
+      `✅ <b>Обращение обработано</b>\n🆔 <code>${rec.id}</code>\n\nСпасибо! Появится вопрос — просто напишите.`,
       { parse_mode: 'HTML', reply_markup: openAppKb(rec.id) }).catch(() => {});
   }
 
-  if (rec.kind !== 'biz' && TOPIC_ANSWERED) await relocateToAnswered(rec);
-  else await refreshCard(rec);
+  if (rec.kind !== 'biz' && TOPIC_ANSWERED) {
+    await relocateToAnswered(rec);
+  } else {
+    if (rec.kind !== 'biz' && !TOPIC_ANSWERED) {
+      console.warn(`closeSuggestion(${rec.id}): TOPIC_ANSWERED не задан — карточка осталась на месте.`);
+    }
+    await refreshCard(rec);
+  }
   updateQueue().catch(() => {});
 }
 
@@ -626,14 +634,14 @@ async function rejectSuggestion(sid) {
   try { await bot.deleteMessage(MOD_CHAT_ID, rec.modMessageId); } catch (e) { console.error('reject del:', e.message); }
 
   const wasAnswered = realMsgs(rec).some(m => m.from === 'mod');
-  if (!wasAnswered) {
-    muteUser(rec.userId);
-    try {
-      await bot.sendMessage(rec.userId,
-        '🚫 <b>Обращение отклонено</b>\n\nК сожалению, ваше предложение отклонено администрацией.\n⏳ Отправить новое можно будет через 15 минут.',
-        { parse_mode: 'HTML', reply_markup: HOME_KB });
-    } catch {}
-  }
+  // Уведомляем подписчика ВСЕГДА. Блокировку на 15 минут вешаем только если ответа ещё не было.
+  if (!wasAnswered) muteUser(rec.userId);
+  const note = wasAnswered
+    ? `🚫 <b>Обращение отклонено администрацией</b>\n🆔 <code>${rec.id}</code>`
+    : '🚫 <b>Обращение отклонено</b>\n\n⏳ Новое можно отправить через 15 минут.';
+  try {
+    await bot.sendMessage(rec.userId, note, { parse_mode: 'HTML', reply_markup: HOME_KB });
+  } catch (e) { console.error('reject notify:', e.message); }
 
   store.del(sid);
   updateQueue().catch(() => {});
@@ -718,7 +726,7 @@ bot.on('message', async (msg) => {
     const kb = (existing.state === 'new' || existing.state === 'processing')
       ? userKb(existing.id) : openAppKb(existing.id);
     await bot.sendMessage(msg.from.id,
-      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>\n\nПродолжайте переписку в приложении.`,
+      `⏳ <b>У вас уже есть активное обращение</b>\n🆔 <code>${existing.id}</code>`,
       { parse_mode: 'HTML', reply_markup: kb }).catch(() => {});
     return;
   }
@@ -730,7 +738,7 @@ bot.on('message', async (msg) => {
     muteUser(msg.from.id);
     const spamText = spamReason === 'flood'
       ? '⚠️ <b>Слишком много сообщений подряд.</b>\n\nОтправка заблокирована на <b>15 минут</b>.'
-      : '⚠️ <b>Повторяющееся сообщение.</b>\n\nНе нужно отправлять одно и то же. Отправка заблокирована на <b>15 минут</b>.';
+      : '⚠️ <b>Повторяющееся сообщение.</b>\n\nОтправка заблокирована на <b>15 минут</b>.';
     await bot.sendMessage(msg.from.id, spamText, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
     console.log(`spam(${spamReason}): user ${msg.from.id} muted`);
     return;
