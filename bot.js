@@ -126,8 +126,21 @@ async function flushBatch() {
         await bot.sendMessage(msg.from.id, text, { parse_mode: 'HTML', reply_markup: HOME_KB }).catch(() => {});
       }
     } else {
-      const kind = cat === 'biz' ? 'biz' : 'normal';
-      await createSuggestion(msg, kind).catch(e => console.error('createSuggestion:', e.message));
+      // Дедуп: если у пользователя уже есть активное обращение (в т.ч. созданное
+      // в этом же батче предыдущей итерацией) — дописываем в него, а не плодим новое.
+      const active = store.all().find(r =>
+        String(r.userId) === String(msg.from.id) && r.state !== 'closed');
+      const body = msg.text || msg.caption || '';
+      if (active) {
+        active.messages = active.messages || [];
+        if (body) active.messages.push({ from: 'user', by: active.userMention, text: body, time: Date.now() });
+        if (active.state === 'answered') active._gateOk = false;
+        store.set(active);
+        await refreshCard(active).catch(() => {});
+      } else {
+        const kind = cat === 'biz' ? 'biz' : 'normal';
+        await createSuggestion(msg, kind).catch(e => console.error('createSuggestion:', e.message));
+      }
     }
   }
 }
@@ -256,6 +269,13 @@ let saveTimer = null;
 function persist() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), () => {}), 200);
+}
+// Синхронный сброс БД на диск (используется перед завершением процесса).
+function persistNow() {
+  try {
+    clearTimeout(saveTimer);
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+  } catch (e) { console.error('persistNow:', e.message); }
 }
 const store = {
   get(id)  { return db.items[String(id)]; },
@@ -451,6 +471,7 @@ async function updateQueue() {
       persist();
     } catch {
       rec.lastShownPos = i;
+      persist();
     }
   }
 }
@@ -738,14 +759,15 @@ bot.on('callback_query', async (q) => {
   const sid = data.includes(':') ? data.split(':')[1] : '';
   try {
     if (data === 'home') {
+      // Убираем сообщение с кнопкой, чтобы в истории не плодились дубли «Меню».
       try {
-        await bot.editMessageText(GREETING, {
-          chat_id: q.message.chat.id, message_id: q.message.message_id, parse_mode: 'HTML',
-        });
-      } catch (e) {
-        if (!String(e.message).includes('message is not modified')) {
-          await bot.sendMessage(q.message.chat.id, GREETING, { parse_mode: 'HTML' }).catch(() => {});
-        }
+        await bot.deleteMessage(q.message.chat.id, q.message.message_id);
+      } catch {
+        // Старше 48 ч удалить нельзя — тогда просто снимаем клавиатуру, чтобы кнопка не висела.
+        try {
+          await bot.editMessageReplyMarkup({ inline_keyboard: [] },
+            { chat_id: q.message.chat.id, message_id: q.message.message_id });
+        } catch {}
       }
       await bot.answerCallbackQuery(q.id);
 
@@ -945,13 +967,18 @@ app.post(`/bot${TOKEN}`, (req, res) => {
   res.sendStatus(200);
 });
 
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM: сбрасываю буфер перед завершением...');
+// Корректное завершение: досбрасываем буфер классификации и синхронно пишем БД на диск.
+// Иначе отложенная на 200 мс запись (persist) теряется при мгновенном process.exit.
+async function gracefulShutdown(signal) {
+  console.log(`${signal}: сбрасываю буфер перед завершением...`);
   if (batchItems.length) {
-    await flushBatch().catch(e => console.error('flushBatch on SIGTERM:', e.message));
+    await flushBatch().catch(e => console.error(`flushBatch on ${signal}:`, e.message));
   }
+  persistNow();
   process.exit(0);
-});
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`Сервер запущен на порту ${PORT}`);
